@@ -315,7 +315,7 @@ class SmokeTest {
             java.io.File(rootDir, "apktool_full/smali_classes2/jex.smali")
         ).filter { it.exists() }
 
-        if (portraitSmaliFiles.isNotEmpty()) {
+        if (portraitSmaliFiles.size == 6) {
             val optionsPortrait = com.android.tools.smali.smali.SmaliOptions()
             val portraitDexOut = java.io.File("src/main/resources/PortraitControllers.dex")
             optionsPortrait.outputDexFile = portraitDexOut.absolutePath
@@ -339,7 +339,7 @@ class SmokeTest {
                 java.io.File(rootDir, "apktool_full/smali/guh.smali")
         ).filter { it.exists() }
 
-        if (zoomSmaliFiles.isNotEmpty()) {
+        if (zoomSmaliFiles.size == 5) {
             val optionsZoom = com.android.tools.smali.smali.SmaliOptions()
             val zoomDexOut = java.io.File("src/main/resources/ZoomControllers.dex")
             optionsZoom.outputDexFile = zoomDexOut.absolutePath
@@ -363,7 +363,7 @@ class SmokeTest {
             java.io.File(rootDir, "apktool_full/smali_classes2/pul.smali")
         ).filter { it.exists() }
 
-        if (quickAccessSmaliFiles.isNotEmpty()) {
+        if (quickAccessSmaliFiles.size == 11) {
             val optionsQA = com.android.tools.smali.smali.SmaliOptions()
             val qaDexOut = java.io.File("src/main/resources/QuickAccessControllers.dex")
             optionsQA.outputDexFile = qaDexOut.absolutePath
