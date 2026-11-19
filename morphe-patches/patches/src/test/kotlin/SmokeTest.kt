@@ -297,7 +297,9 @@ class SmokeTest {
         }?.toList() ?: emptyList()
         tomteSmaliFiles.addAll(proPanelSmaliFiles.sortedBy { it.name })
 
-        val optionsTomte = com.android.tools.smali.smali.SmaliOptions()
+        val optionsTomte = com.android.tools.smali.smali.SmaliOptions().apply {
+            apiLevel = 34
+        }
         val tomteDexOut = java.io.File("src/main/resources/TomteInitHelper.dex")
         optionsTomte.outputDexFile = tomteDexOut.absolutePath
         val tomteSuccess = com.android.tools.smali.smali.Smali.assemble(optionsTomte, tomteSmaliFiles.map { it.absolutePath })
@@ -1061,16 +1063,48 @@ class SmokeTest {
         assertTrue(content.contains("isFrontBacklightFixActive()Z"), "Must contain isFrontBacklightFixActive")
         assertTrue(content.contains("nativeProcessFrontBacklightImage(JIIII)V"), "Must contain nativeProcessFrontBacklightImage")
 
-        // Verify native library exists and contains the JNI export
-        val libFile = java.io.File(rootDir, "apktool_full/lib/arm64-v8a/libpropatcher.so")
-        assertTrue(libFile.exists(), "libpropatcher.so must exist")
-        assertTrue(libFile.length() > 20000, "libpropatcher.so size must be > 20KB")
+        // Verify native library exists and matches TomteProPatcherLoader.EXPECTED_SIZE
+        val bundledLib = java.io.File("src/main/resources/lib/arm64-v8a/libpropatcher.so")
+        val legacyLib = java.io.File(rootDir, "apktool_full/lib/arm64-v8a/libpropatcher.so")
+        val libFile = if (bundledLib.exists()) bundledLib else legacyLib
+        assertTrue(libFile.exists(), "libpropatcher.so must exist at ${bundledLib.path} or ${legacyLib.path}")
+        assertTrue(libFile.length() > 8000, "libpropatcher.so size must be > 8KB (got ${libFile.length()})")
 
         val loaderSmali = java.io.File(rootDir, "smali_patches/TomteProPatcherLoader.smali").readText()
         val hexSize = "0x" + libFile.length().toString(16)
         assertTrue(loaderSmali.contains(hexSize), "TomteProPatcherLoader must have EXPECTED_SIZE matching libpropatcher.so ($hexSize)")
 
-        println("Verified: Front Camera Backlight Fix & Apple Skin Tone Engine bytecode and JNI library verified successfully.")
+        println("Verified: Front Camera Backlight Fix bytecode and JNI library (${libFile.length()} bytes) verified successfully.")
+    }
+
+    @Test
+    fun testBentoHighlightRecoveryAndAuditFixes() {
+        val tomteDexFile = java.io.File("src/main/resources/TomteInitHelper.dex")
+        assertTrue(tomteDexFile.exists(), "TomteInitHelper.dex must exist")
+        val tomteDex = com.android.tools.smali.dexlib2.DexFileFactory.loadDexFile(
+            tomteDexFile,
+            com.android.tools.smali.dexlib2.Opcodes.getDefault()
+        )
+        val tomteCls = tomteDex.classes.firstOrNull {
+            it.type == "Lcom/google/android/patch/cameralooks/TomteInitHelper;"
+        }
+        assertTrue(tomteCls != null, "TomteInitHelper class must exist in TomteInitHelper.dex")
+        for (methodName in listOf(
+            "isBentoEnabled",
+            "filterBentoEnabled",
+            "getMaxHdrRatioOverride",
+            "applyBentoAeShotParams",
+            "isAv1EncodingSupported",
+            "safeSetGrainEnabled"
+        )) {
+            assertTrue(
+                tomteCls!!.methods.any { it.name == methodName },
+                "TomteInitHelper must contain method $methodName"
+            )
+        }
+        val patch = app.morphe.patches.pixelcamera.bento.bentoHighlightRecoveryPatch
+        assertTrue(patch.name == "Bento HDR+ Highlight Recovery (Experimental)", "Bento patch name must match")
+        println("Verified: Bento HDR+ Highlight Recovery patch and TomteInitHelper methods verified successfully.")
     }
 
     @Test

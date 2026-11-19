@@ -109,19 +109,30 @@ jobs:
             --rerun-tasks --no-daemon --info
           ls -lh patches/src/main/resources/TomteInitHelper.dex
 
-      - name: Build Morphe Patch Package (.mpp) and Run Tests
+      - name: Run Patch Verification Tests
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: morphe-patches
         run: |
-          ./gradlew :patches:buildAndroid :patches:test --no-daemon
+          ./gradlew :patches:test --no-daemon --info
+
+      - name: Build Morphe Patch Package (.mpp)
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: morphe-patches
+        run: |
+          ./gradlew :patches:buildAndroid --no-daemon --info
           echo "=== Built artifacts ==="
           ls -lh patches/build/libs/
           MPP_FILE="$(ls patches/build/libs/*.mpp | head -n 1)"
-          cp "$MPP_FILE" "patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp" || true
+          TARGET_MPP="patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp"
+          if [ "$MPP_FILE" != "$TARGET_MPP" ]; then
+            cp "$MPP_FILE" "$TARGET_MPP"
+          fi
           echo "=== Inspecting .mpp entries ==="
-          unzip -l "$MPP_FILE" | head -n 60
+          unzip -l "$TARGET_MPP" | head -n 60
 
       - name: Upload .mpp Artifact
         uses: actions/upload-artifact@v4
