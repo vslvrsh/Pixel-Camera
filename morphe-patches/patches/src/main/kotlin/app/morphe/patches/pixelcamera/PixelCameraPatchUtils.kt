@@ -426,6 +426,96 @@ object PixelCameraPatchUtils {
     }
 
     /**
+     * Builds a valid Dalvik invoke-static instruction for a single 32-bit/object register,
+     * automatically using invoke-static/range when reg >= 16 to avoid 4-bit register overflow.
+     */
+    fun invokeStaticSingleReg(reg: Int, methodSignature: String): String {
+        return if (reg < 16) {
+            "invoke-static {v$reg}, $methodSignature"
+        } else {
+            "invoke-static/range {v$reg .. v$reg}, $methodSignature"
+        }
+    }
+
+    /**
+     * Routes ksf.b(Lkps;)Ljava/lang/String; through ksf.h(Lkps;)Ljava/lang/String; so
+     * Portrait model lookups via qfz cannot bypass the guarded CPU model routing table.
+     */
+    fun hookKlmFlagB(clazz: MutableClass?) {
+        if (clazz == null) return
+        hookKlmFlagH(clazz)
+        val smaliB = """
+            invoke-virtual {p0, p1}, Lksf;->h(Lkps;)Ljava/lang/String;
+            move-result-object v0
+            return-object v0
+        """.trimIndent()
+        replaceMethodWithRegisterCount(
+            clazz,
+            "b",
+            "Ljava/lang/String;",
+            listOf("Lkps;"),
+            3,
+            smaliB
+        )
+    }
+
+    /**
+     * Bundles lib/arm64-v8a/libpropatcher.so directly inside the patched APK so Android
+     * loads it natively via System.loadLibrary("propatcher") without SELinux DCL blocks.
+     * Also registers the .so path in Morphe's uncompressed-files.json when extractNativeLibs="false".
+     */
+    fun injectNativeProPatcherLib(context: ResourcePatchContext) {
+        try {
+            val stream = PixelCameraPatchUtils::class.java.classLoader
+                .getResourceAsStream("lib/arm64-v8a/libpropatcher.so") ?: return
+            val soBytes = stream.use { it.readBytes() }
+            if (soBytes.isEmpty()) return
+
+            val outSo = context.get("lib/arm64-v8a/libpropatcher.so", false)
+            outSo.parentFile?.mkdirs()
+            outSo.writeBytes(soBytes)
+
+            // Ensure Morphe stores libpropatcher.so uncompressed (STORED + aligned) when APK uses extractNativeLibs="false"
+            try {
+                val manifestFile = context.get("AndroidManifest.xml", false)
+                val uncompressedFile = manifestFile.parentFile?.resolve("uncompressed-files.json")
+                if (uncompressedFile != null && uncompressedFile.exists()) {
+                    val jsonObj = com.google.gson.JsonParser.parseString(
+                        uncompressedFile.readText(Charsets.UTF_8)
+                    ).asJsonObject
+                    val extensions = jsonObj.getAsJsonArray("extensions")
+                    var hasSoExt = false
+                    if (extensions != null) {
+                        for (el in extensions) {
+                            val ext = el.asString
+                            if (ext == ".so" || ext == "so") {
+                                hasSoExt = true
+                                break
+                            }
+                        }
+                    }
+                    if (!hasSoExt) {
+                        val paths = jsonObj.getAsJsonArray("paths")
+                            ?: com.google.gson.JsonArray().also { jsonObj.add("paths", it) }
+                        val targetPath = "lib/arm64-v8a/libpropatcher.so"
+                        var alreadyPresent = false
+                        for (el in paths) {
+                            if (el.asString == targetPath) {
+                                alreadyPresent = true
+                                break
+                            }
+                        }
+                        if (!alreadyPresent) {
+                            paths.add(targetPath)
+                            uncompressedFile.writeText(jsonObj.toString(), Charsets.UTF_8)
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        } catch (_: Throwable) {}
+    }
+
+    /**
      * Routes Gouda's panoptic segmenter to the bundled CPU model. The P26
      * default is a TPU model and cannot run on the Tensor G3 (P23) Pixel 8 Pro.
      */
@@ -1146,7 +1236,7 @@ object PixelCameraPatchUtils {
                         append("""
     <string name="pref_category_about_title">About</string>
     <string name="pref_about_title">Pixel Camera</string>
-    <string name="pref_about_version_summary">version 11.1.040.982810059.19 (v1.1.3)</string>
+    <string name="pref_about_version_summary">version 11.1.040.982810059.19 (v1.1.4-p7p-bento)</string>
                         """.trimIndent())
                         append("\n")
                     }
@@ -1154,6 +1244,24 @@ object PixelCameraPatchUtils {
                         append("""
     <string name="pref_camera_focal_length_cycling_title">1x Focal Length Cycling</string>
     <string name="pref_camera_focal_length_cycling_summary">Tap the 1× button to switch between 24 mm, 28 mm, and 35 mm focal lengths.\nWhen off, 1× remain locked at native optical 1×.</string>
+                        """.trimIndent())
+                        append("\n")
+                    }
+                    if (!content.contains("pref_camera_bento_hdr_title")) {
+                        append("""
+    <string name="pref_camera_bento_hdr_title">Bento HDR+ Highlight Recovery</string>
+    <string name="pref_camera_bento_hdr_summary">Experimental: enables Google Bento highlight recovery on rear cameras for deeper highlight roll-off and wider dynamic range</string>
+    <string name="pref_camera_hdr_ratio_title">HDR+ Dynamic Range Ratio</string>
+    <string name="pref_camera_hdr_ratio_entry_stock">Stock (Default)</string>
+    <string name="pref_camera_hdr_ratio_entry_stock_desc">Standard Google Camera AE exposure bracketing ratio</string>
+    <string name="pref_camera_hdr_ratio_entry_16">16x (+4 EV — Balanced Bento)</string>
+    <string name="pref_camera_hdr_ratio_entry_16_desc">Balanced highlight headroom for bright lights and backlit skies</string>
+    <string name="pref_camera_hdr_ratio_entry_24">24x (+4.6 EV — Extended DR)</string>
+    <string name="pref_camera_hdr_ratio_entry_24_desc">Strong highlight protection around lamps, signage, and direct sunlight</string>
+    <string name="pref_camera_hdr_ratio_entry_32">32x (+5 EV — Maximum Highlights)</string>
+    <string name="pref_camera_hdr_ratio_entry_32_desc">Maximum exposure bracket ratio for extreme high-contrast scenes</string>
+    <string name="pref_camera_front_backlight_fix_title">Front Camera Backlight Fix</string>
+    <string name="pref_camera_front_backlight_fix_summary">Subtle backlit shadow lift and gentle warm skin tone recovery on selfie camera</string>
                         """.trimIndent())
                         append("\n")
                     }
@@ -1306,6 +1414,29 @@ object PixelCameraPatchUtils {
                         """.trimIndent())
                         append("\n")
                     }
+                    if (!content.contains("pref_camera_hdr_ratio_entries")) {
+                        append("""
+    <string-array name="pref_camera_hdr_ratio_entries">
+        <item>@string/pref_camera_hdr_ratio_entry_stock</item>
+        <item>@string/pref_camera_hdr_ratio_entry_16</item>
+        <item>@string/pref_camera_hdr_ratio_entry_24</item>
+        <item>@string/pref_camera_hdr_ratio_entry_32</item>
+    </string-array>
+    <string-array name="pref_camera_hdr_ratio_entrydescriptions">
+        <item>@string/pref_camera_hdr_ratio_entry_stock_desc</item>
+        <item>@string/pref_camera_hdr_ratio_entry_16_desc</item>
+        <item>@string/pref_camera_hdr_ratio_entry_24_desc</item>
+        <item>@string/pref_camera_hdr_ratio_entry_32_desc</item>
+    </string-array>
+    <string-array name="pref_camera_hdr_ratio_entryvalues">
+        <item>stock</item>
+        <item>16</item>
+        <item>24</item>
+        <item>32</item>
+    </string-array>
+                        """.trimIndent())
+                        append("\n")
+                    }
                 }
                 if (arraysToInject.isNotBlank()) {
                     content = content.replace("<resources>", "<resources>\n    $arraysToInject")
@@ -1328,6 +1459,9 @@ object PixelCameraPatchUtils {
         <com.google.android.apps.camera.ui.preference.ListWithDescriptionsPreferenceCompat android:icon="@drawable/gs_details_vd_theme_24" android:entries="@array/pref_camera_sharpness_entries" android:title="@string/pref_camera_sharpness_title" android:key="pref_camera_sharpness_key" android:summary="%s" android:order="4" android:defaultValue="natural" android:entryValues="@array/pref_camera_sharpness_entryvalues" />
         <com.google.android.apps.camera.ui.preference.ListWithDescriptionsPreferenceCompat android:icon="@drawable/gs_raw_on_vd_theme_24" android:entries="@array/pref_camera_raw_compression_entries" android:title="@string/pref_camera_raw_compression_title" android:key="pref_camera_raw_compression_key" android:summary="%s" android:order="5" android:defaultValue="uncompressed" android:entryValues="@array/pref_camera_raw_compression_entryvalues" />
         <com.google.android.apps.camera.ui.preference.ManagedSwitchPreferenceCompat android:icon="@drawable/gs_raw_on_vd_theme_24" android:title="@string/pref_camera_raw_separate_folder_title" android:key="pref_camera_raw_separate_folder_key" android:summary="@string/pref_camera_raw_separate_folder_summary" android:order="6" android:defaultValue="true" />
+        <com.google.android.apps.camera.ui.preference.ManagedSwitchPreferenceCompat android:icon="@drawable/gs_brightness_7_vd_theme_24" android:title="@string/pref_camera_bento_hdr_title" android:key="pref_camera_bento_hdr_key" android:summary="@string/pref_camera_bento_hdr_summary" android:order="7" android:defaultValue="true" />
+        <com.google.android.apps.camera.ui.preference.ListWithDescriptionsPreferenceCompat android:icon="@drawable/gs_high_res_vd_theme_24" android:entries="@array/pref_camera_hdr_ratio_entries" android:title="@string/pref_camera_hdr_ratio_title" android:key="pref_camera_hdr_ratio_key" android:summary="%s" android:order="8" android:defaultValue="16" android:entryValues="@array/pref_camera_hdr_ratio_entryvalues" />
+        <com.google.android.apps.camera.ui.preference.ManagedSwitchPreferenceCompat android:icon="@drawable/gs_photo_camera_vd_theme_24" android:title="@string/pref_camera_front_backlight_fix_title" android:key="pref_camera_front_backlight_fix_key" android:summary="@string/pref_camera_front_backlight_fix_summary" android:order="9" android:defaultValue="false" />
     </androidx.preference.PreferenceCategory>
                     """.trimIndent()
 
@@ -1388,6 +1522,9 @@ object PixelCameraPatchUtils {
         <ListPreference android:icon="@drawable/gs_details_vd_theme_24" android:entries="@array/pref_camera_sharpness_entries" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_sharpness_title" android:key="pref_camera_sharpness_key" android:summary="%s" android:order="4" android:defaultValue="natural" android:entryValues="@array/pref_camera_sharpness_entryvalues" />
         <ListPreference android:icon="@drawable/gs_raw_on_vd_theme_24" android:entries="@array/pref_camera_raw_compression_entries" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_raw_compression_title" android:key="pref_camera_raw_compression_key" android:summary="%s" android:order="5" android:defaultValue="uncompressed" android:entryValues="@array/pref_camera_raw_compression_entryvalues" />
         <com.google.android.apps.camera.ui.preference.ManagedSwitchPreference android:icon="@drawable/gs_raw_on_vd_theme_24" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_raw_separate_folder_title" android:key="pref_camera_raw_separate_folder_key" android:summary="@string/pref_camera_raw_separate_folder_summary" android:order="6" android:defaultValue="true" />
+        <com.google.android.apps.camera.ui.preference.ManagedSwitchPreference android:icon="@drawable/gs_brightness_7_vd_theme_24" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_bento_hdr_title" android:key="pref_camera_bento_hdr_key" android:summary="@string/pref_camera_bento_hdr_summary" android:order="7" android:defaultValue="true" />
+        <ListPreference android:icon="@drawable/gs_high_res_vd_theme_24" android:entries="@array/pref_camera_hdr_ratio_entries" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_hdr_ratio_title" android:key="pref_camera_hdr_ratio_key" android:summary="%s" android:order="8" android:defaultValue="16" android:entryValues="@array/pref_camera_hdr_ratio_entryvalues" />
+        <com.google.android.apps.camera.ui.preference.ManagedSwitchPreference android:icon="@drawable/gs_photo_camera_vd_theme_24" android:layout="@layout/preference_with_margin" android:title="@string/pref_camera_front_backlight_fix_title" android:key="pref_camera_front_backlight_fix_key" android:summary="@string/pref_camera_front_backlight_fix_summary" android:order="9" android:defaultValue="false" />
     </PreferenceCategory>
                     """.trimIndent()
 

@@ -2,6 +2,7 @@ package app.morphe.patches.pixelcamera
 
 import app.morphe.patcher.Patcher
 import app.morphe.patcher.PatcherConfig
+import app.morphe.patches.pixelcamera.bento.bentoHighlightRecoveryPatch
 import app.morphe.patches.pixelcamera.brightness.maxBrightnessPatch
 import app.morphe.patches.pixelcamera.clone.pixelCameraClonePatch
 import app.morphe.patches.pixelcamera.creator.creatorSuitePatch
@@ -44,6 +45,7 @@ class PatcherExecutionTest {
             videoLensSwitchingPatch,
             maxBrightnessPatch,
             proImageQualityPatch,
+            bentoHighlightRecoveryPatch,
             pixelCameraClonePatch
         )
         for (p in allPatches) {
@@ -337,11 +339,6 @@ class PatcherExecutionTest {
         val ok = com.android.tools.smali.smali.Smali.assemble(options, smaliFiles)
         assertTrue(ok, "Smali assemble must succeed")
         println("Assembled to ${outDex.absolutePath} (${outDex.length()} bytes)")
-        val rootRes = File("../src/main/resources/TomteInitHelper.dex")
-        if (rootRes.parentFile.exists()) {
-            outDex.copyTo(rootRes, overwrite = true)
-            println("Copied to ${rootRes.absolutePath}")
-        }
     }
 }
 

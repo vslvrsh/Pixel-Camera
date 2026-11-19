@@ -2,12 +2,22 @@ name: Build Morphe Patch Package
 
 on:
   push:
+    branches:
+      - main
     paths:
       - 'morphe-patches/**'
+      - 'jni/**'
+      - 'smali_patches/**'
+      - 'patches-bundle.json'
+      - 'patches-list.json'
       - '.github/workflows/build-morphe-patch.yml'
   workflow_dispatch:
   release:
     types: [published]
+
+permissions:
+  contents: write
+  packages: read
 
 jobs:
   build-mpp:
@@ -23,35 +33,107 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Grant Execute Permission for Gradlew
+      - name: Compile native libpropatcher.so (arm64-v8a, 16KB aligned)
         run: |
-          if [ -f "morphe-patches/gradlew" ]; then
-            chmod +x morphe-patches/gradlew
+          set -euo pipefail
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_DIR" ] || [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR="$(ls -d "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
           fi
+          echo "Using Android NDK: $NDK_DIR"
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$(ls "$TOOLCHAIN"/aarch64-linux-android3[0-9]-clang 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$CLANG" ]; then
+            CLANG="$(ls "$TOOLCHAIN"/aarch64-linux-android*-clang 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          STRIP="$TOOLCHAIN/llvm-strip"
+          echo "Using compiler: $CLANG"
 
-      - name: Build Morphe Patch Package (.mpp)
+          OUT_DIR="morphe-patches/patches/src/main/resources/lib/arm64-v8a"
+          mkdir -p "$OUT_DIR"
+          OUT_SO="$OUT_DIR/libpropatcher.so"
+
+          "$CLANG" -shared -fPIC -O3 -ffast-math -Wall -Wextra \
+            -Wl,-z,max-page-size=16384 \
+            -o "$OUT_SO" \
+            jni/propatcher/propatcher.c \
+            -llog -landroid -lm
+
+          if [ -x "$STRIP" ]; then
+            "$STRIP" --strip-unneeded "$OUT_SO"
+          fi
+          ls -lh "$OUT_SO"
+          file "$OUT_SO"
+
+      - name: Sync SO_BASE64 and EXPECTED_SIZE in TomteProPatcherLoader.smali
+        run: |
+          python3 - << 'EOF'
+          import base64, pathlib, re
+
+          so_path = pathlib.Path("morphe-patches/patches/src/main/resources/lib/arm64-v8a/libpropatcher.so")
+          smali_path = pathlib.Path("smali_patches/TomteProPatcherLoader.smali")
+
+          so_bytes = so_path.read_bytes()
+          b64 = base64.b64encode(so_bytes).decode("ascii")
+          size_hex = hex(len(so_bytes))
+
+          content = smali_path.read_text(encoding="utf-8")
+          content, n1 = re.subn(
+              r'(\.field private static final EXPECTED_SIZE:I = )0x[0-9a-fA-F]+',
+              rf'\g<1>{size_hex}',
+              content,
+              count=1
+          )
+          content, n2 = re.subn(
+              r'(\.field private static final SO_BASE64:Ljava/lang/String; = ")[^"]*(")',
+              rf'\g<1>{b64}\g<2>',
+              content,
+              count=1
+          )
+          assert n1 == 1 and n2 == 1, f"Failed to update TomteProPatcherLoader.smali (n1={n1}, n2={n2})"
+          smali_path.write_text(content, encoding="utf-8")
+          print(f"Updated TomteProPatcherLoader.smali: EXPECTED_SIZE={size_hex} ({len(so_bytes)} bytes), SO_BASE64={len(b64)} chars")
+          EOF
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x morphe-patches/gradlew
+
+      - name: Assemble TomteInitHelper.dex from smali_patches
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: morphe-patches
         run: |
-          if [ -f "./gradlew" ]; then
-            ./gradlew buildAndroid --no-daemon || ./gradlew :patches:buildAndroid --no-daemon || ./gradlew build --no-daemon
-          else
-            gradle buildAndroid --no-daemon || gradle :patches:buildAndroid --no-daemon || gradle build --no-daemon || true
-          fi
+          ./gradlew :patches:test \
+            --tests "app.morphe.patches.pixelcamera.PatcherExecutionTest.assembleTomteInitHelper" \
+            --rerun-tasks --no-daemon --info
+          ls -lh patches/src/main/resources/TomteInitHelper.dex
+
+      - name: Build Morphe Patch Package (.mpp) and Run Tests
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: morphe-patches
+        run: |
+          ./gradlew :patches:buildAndroid :patches:test --no-daemon
+          echo "=== Built artifacts ==="
+          ls -lh patches/build/libs/
+          MPP_FILE="$(ls patches/build/libs/*.mpp | head -n 1)"
+          cp "$MPP_FILE" "patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp" || true
+          echo "=== Inspecting .mpp entries ==="
+          unzip -l "$MPP_FILE" | head -n 60
 
       - name: Upload .mpp Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: morphe-patches-pixelcamera
-          path: morphe-patches/**/build/libs/*.mpp
-          if-no-files-found: warn
+          name: morphe-patches-pixelcamera-p7p-bento
+          path: morphe-patches/patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp
+          if-no-files-found: error
 
       - name: Attach .mpp to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: morphe-patches/**/build/libs/*.mpp
+          files: morphe-patches/patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

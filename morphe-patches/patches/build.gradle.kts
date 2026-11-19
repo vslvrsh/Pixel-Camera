@@ -1,14 +1,14 @@
 group = "app.morphe.patches.pixelcamera"
-version = "1.1.4"
+version = "1.1.4-p7p-bento"
 
 patches {
     about {
-        name = "Pixel Camera Looks & Creator Patches"
-        description = "Unlocks Camera Looks, Viewfinder Controls, 10x Zoom, and Creator Suite on Pixel 6-10"
-        source = "https://github.com/akshayykadam/Pixel-Camera"
-        author = "Akshay Kadam"
+        name = "Pixel Camera Looks, Bento HDR+ & Creator Patches"
+        description = "Unlocks Camera Looks, Experimental Bento HDR+ Highlight Recovery, Viewfinder Controls, 10x Zoom, Pro 50MP & Creator Suite on Pixel 6-10 (Pixel 7 Pro tuned)"
+        source = "https://github.com/vslvrsh/Pixel-Camera"
+        author = "Akshay Kadam / vslvrsh fork"
         contact = "na"
-        website = "https://github.com/akshayykadam/Pixel-Camera"
+        website = "https://github.com/vslvrsh/Pixel-Camera"
         license = "GPLv3"
     }
 }

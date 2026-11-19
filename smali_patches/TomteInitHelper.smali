@@ -30,6 +30,10 @@
 
 .field public static final PREF_FRONT_BACKLIGHT_FIX:Ljava/lang/String; = "pref_camera_front_backlight_fix_key"
 
+.field public static final PREF_BENTO_HDR:Ljava/lang/String; = "pref_camera_bento_hdr_key"
+
+.field public static final PREF_HDR_RATIO:Ljava/lang/String; = "pref_camera_hdr_ratio_key"
+
 .field public static sIsFrontCamera:Z
 
 .field public static sCurrentActivity:Ljava/lang/ref/WeakReference;
@@ -657,6 +661,20 @@
     return-void
 .end method
 
+.method private static safeSetGrainEnabled(Z)V
+    .locals 0
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->ensureNativeLoaded()V
+
+    :try_start_safe_grain
+    invoke-static {p0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    :try_end_safe_grain
+    .catch Ljava/lang/Throwable; {:try_start_safe_grain .. :try_end_safe_grain} :catch_safe_grain
+
+    :catch_safe_grain
+    return-void
+.end method
+
 .method public static updateDetailFineTuning(IF)V
     .locals 2
 
@@ -681,14 +699,14 @@
 
     const/4 v0, 0x1
 
-    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
 
     goto :cond_sync
 
     :cond_grain_off
     const/4 v0, 0x0
 
-    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
 
     :cond_sync
     const/4 v0, 0x1
@@ -753,12 +771,14 @@
 
     const/4 v1, 0x0
 
-    :try_start_reset
-    invoke-static {v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
-    :try_end_reset
-    .catch Ljava/lang/Throwable; {:try_start_reset .. :try_end_reset} :catch_reset
+    sput-boolean v1, Lcom/google/android/patch/cameralooks/TomteInitHelper;->sHasCustomTone:Z
 
-    :catch_reset
+    sput-boolean v1, Lcom/google/android/patch/cameralooks/TomteInitHelper;->sHasCustomColor:Z
+
+    sput-boolean v1, Lcom/google/android/patch/cameralooks/TomteInitHelper;->sHasCustomDetail:Z
+
+    invoke-static {v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
+
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->syncFineTuningToNative()V
 
     return-void
@@ -796,7 +816,7 @@
 
     sput-boolean v1, Lcom/google/android/patch/cameralooks/TomteInitHelper;->sHasCustomDetail:Z
 
-    invoke-static {v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    invoke-static {v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
 
     if-gtz p0, :cond_has_look
 
@@ -1014,7 +1034,11 @@
 
     if-lt v2, v3, :cond_aura_check_detail
 
-    # Legacy fallback: aura had color vector
+    # Legacy fallback: aura had color vector (only if caps did not already set custom color)
+    sget-boolean v2, Lcom/google/android/patch/cameralooks/TomteInitHelper;->sHasCustomColor:Z
+
+    if-nez v2, :cond_check_grain_state
+
     const/4 v2, 0x0
 
     aget-object v2, v1, v2
@@ -1095,14 +1119,14 @@
 
     const/4 v2, 0x1
 
-    invoke-static {v2}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    invoke-static {v2}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
 
     goto :cond_done
 
     :cond_grain_loaded_off
     const/4 v2, 0x0
 
-    invoke-static {v2}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeSetGrainEnabled(Z)V
+    invoke-static {v2}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->safeSetGrainEnabled(Z)V
 
     :cond_done
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->syncFineTuningToNative()V
@@ -3224,6 +3248,46 @@
     invoke-static {v0, v1, p0, v3}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_strengthen_denoise_for_sky_set(JLcom/google/googlex/gcam/ShotParams;Z)V
 
     :cond_check_sharpen
+    # Experimental Bento HDR+ Highlight Recovery & Max HDR Ratio Override (rear cameras)
+    :try_start_bento_ae
+    invoke-virtual {p0}, Lcom/google/googlex/gcam/ShotParams;->a()Lcom/google/googlex/gcam/AeShotParams;
+
+    move-result-object v2
+
+    invoke-static {v2}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->applyBentoAeShotParams(Lcom/google/googlex/gcam/AeShotParams;)V
+    :try_end_bento_ae
+    .catch Ljava/lang/Throwable; {:try_start_bento_ae .. :try_end_bento_ae} :catch_bento_ae
+
+    :catch_bento_ae
+    :try_start_bento_shot
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
+
+    move-result v2
+
+    if-nez v2, :cond_bento_done
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v2
+
+    if-eqz v2, :cond_bento_done
+
+    const/4 v2, 0x1
+
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_bento_enabled_set(JLcom/google/googlex/gcam/ShotParams;Z)V
+
+    # Always keep EdgeTPU bento_edamame off on non-Pixel-11 devices to prevent TPU crashes
+    const/4 v2, 0x0
+
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_bento_edamame_enabled_set(JLcom/google/googlex/gcam/ShotParams;Z)V
+
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_bento_edamame_force_apply_set(JLcom/google/googlex/gcam/ShotParams;Z)V
+
+    :cond_bento_done
+    :try_end_bento_shot
+    .catch Ljava/lang/Throwable; {:try_start_bento_shot .. :try_end_bento_shot} :catch_bento_shot
+
+    :catch_bento_shot
     :try_end_shotparams
     .catch Ljava/lang/Throwable; {:try_start_shotparams .. :try_end_shotparams} :catch_shotparams
 
@@ -5433,19 +5497,6 @@
 
     if-eqz v0, :cond_check_ark_lens
 
-    const-string v0, "camera.lasagna.use_darwinn"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_lasagna_false
-
-    const/4 v0, 0x1
-
-    return v0
-
-    :cond_lasagna_false
     const/4 v0, 0x0
 
     return v0
@@ -5743,22 +5794,9 @@
 
     move-result v0
 
-    if-eqz v0, :cond_check_tpu_del
-
-    const/4 v0, 0x1
-
-    return v0
-
-    :cond_check_tpu_del
-    const-string v0, "segmenter_use_darwinn_tpu_delegate"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
-
-    move-result v0
-
     if-eqz v0, :cond_check_almond
 
-    const/4 v0, 0x0
+    const/4 v0, 0x1
 
     return v0
 
@@ -5777,19 +5815,6 @@
 
     :cond_check_cyclops
     const-string v0, "camera.cyclops_use_tpu"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_check_offline_comp
-
-    const/4 v0, 0x0
-
-    return v0
-
-    :cond_check_offline_comp
-    const-string v0, "camera.gouda.use_darwinn_offline_compilation"
 
     invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
 
@@ -5875,6 +5900,13 @@
 
     if-eqz v0, :cond_check_milk
 
+    # Only disable Eclipse AE on Pixel 10 family; preserve highlight-aware Eclipse AE on Pixel 6-9 (incl. 7 Pro)
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_not_found
+
     const/4 v0, 0x0
 
     return v0
@@ -5901,7 +5933,7 @@
 
     if-eqz v0, :cond_check_front_learned
 
-    const/4 v0, 0x1
+    const/4 v0, 0x0
 
     return v0
 
@@ -5914,25 +5946,12 @@
 
     if-eqz v0, :cond_check_physeter
 
-    const/4 v0, 0x1
+    const/4 v0, 0x0
 
     return v0
 
     :cond_check_physeter
     const-string v0, "physeter"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_check_generic_tpu
-
-    const/4 v0, 0x0
-
-    return v0
-
-    :cond_check_generic_tpu
-    const-string v0, "use_tpu"
 
     invoke-virtual {p0, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
 
@@ -5951,22 +5970,95 @@
 
     move-result v0
 
-    if-eqz v0, :cond_check_jellybean_setting
+    if-eqz v0, :cond_check_bento_edamame
 
-    const-string v0, "camera.lasagna.use_darwinn"
+    const/4 v0, 0x0
 
-    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+    return v0
+
+    :cond_check_bento_edamame
+    const-string v0, "bento_edamame"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
 
     move-result v0
 
-    if-eqz v0, :cond_darwinn_false
+    if-eqz v0, :cond_check_bento_flag
+
+    const/4 v0, 0x0
+
+    return v0
+
+    :cond_check_bento_flag
+    const-string v0, "camera.bento"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-nez v0, :cond_bento_flag_hit
+
+    const-string v0, "camera.enable_bento"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-nez v0, :cond_bento_flag_hit
+
+    const-string v0, "gcam.bento"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_check_lobster
+
+    :cond_bento_flag_hit
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_not_found
 
     const/4 v0, 0x1
 
     return v0
 
-    :cond_darwinn_false
+    :cond_check_lobster
+    const-string v0, "camera.lobster"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_check_jellybean_setting
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isProDevice()Z
+
+    move-result v0
+
+    if-nez v0, :cond_lobster_pro
+
     const/4 v0, 0x0
+
+    return v0
+
+    :cond_lobster_pro
+    const-string v0, "camera.lobster.default"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_lobster_enable
+
+    const/4 v0, 0x0
+
+    return v0
+
+    :cond_lobster_enable
+    const/4 v0, 0x1
 
     return v0
 
@@ -5979,7 +6071,9 @@
 
     if-eqz v0, :cond_check_jellybean_feature
 
-    const/4 v0, 0x1
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isAv1EncodingSupported()Z
+
+    move-result v0
 
     return v0
 
@@ -5992,7 +6086,9 @@
 
     if-eqz v0, :cond_check_24fps
 
-    const/4 v0, 0x1
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isAv1EncodingSupported()Z
+
+    move-result v0
 
     return v0
 
@@ -6981,9 +7077,35 @@
 
     move-result v1
 
-    if-eqz v1, :cond_check_orig_h
+    if-eqz v1, :cond_check_gouda_fg_color_model
 
     const-string v0, "all_in_film_blender.tflite.uncompressed"
+
+    return-object v0
+
+    :cond_check_gouda_fg_color_model
+    const-string v1, "camera.gouda.foreground_color_estimator_model"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_check_sauce_grain_model
+
+    const-string v0, "foreground_color_estimator_v5680_512_512.tflite.uncompressed"
+
+    return-object v0
+
+    :cond_check_sauce_grain_model
+    const-string v1, "camera.sauce_grain_model_asset_name"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_check_orig_h
+
+    const-string v0, "3cdbac706c98421a96e16fdbfd97a35f.tflite.uncompressed"
 
     return-object v0
 
@@ -8278,7 +8400,7 @@
 .method public static filterProPreferencesForRex(Ljava/lang/Object;)V
     .locals 1
 
-    if-nez p0, :cond_ret
+    if-eqz p0, :cond_ret
 
     :try_start_0
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isProDevice()Z
@@ -8385,9 +8507,49 @@
 .end method
 
 .method public static isFrontBacklightFixEnabled()Z
-    .locals 1
+    .locals 3
 
-    const/4 v0, 0x1
+    :try_start_fbf
+    const-string v0, "pref_camera_front_backlight_fix_key"
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getPrefEntry(Ljava/lang/String;)Ljava/lang/Object;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_fbf_check_sp
+
+    const/4 v1, 0x0
+
+    invoke-static {v0, v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->checkPrefValue(Ljava/lang/Object;Z)Z
+
+    move-result v0
+
+    return v0
+
+    :cond_fbf_check_sp
+    const/4 v0, 0x0
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getSharedPrefs(Landroid/content/Context;)Landroid/content/SharedPreferences;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_fbf_false
+
+    const-string v2, "pref_camera_front_backlight_fix_key"
+
+    const/4 v1, 0x0
+
+    invoke-interface {v0, v2, v1}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z
+
+    move-result v0
+
+    return v0
+    :try_end_fbf
+    .catchall {:try_start_fbf .. :try_end_fbf} :catchall_fbf
+
+    :catchall_fbf
+    :cond_fbf_false
+    const/4 v0, 0x0
 
     return v0
 .end method
@@ -8398,6 +8560,17 @@
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
 
     move-result v0
+
+    if-eqz v0, :cond_fbf_inactive
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontBacklightFixEnabled()Z
+
+    move-result v0
+
+    return v0
+
+    :cond_fbf_inactive
+    const/4 v0, 0x0
 
     return v0
 .end method
@@ -8995,6 +9168,7 @@
 
     if-eqz v0, :cond_non_50mp
 
+    :try_start_int_pref
     const-string v1, "pref_capture_resolution"
 
     const/4 v2, 0x0
@@ -9008,6 +9182,8 @@
     if-ne v1, v3, :cond_check_str_pref
 
     return v3
+    :try_end_int_pref
+    .catch Ljava/lang/Throwable; {:try_start_int_pref .. :try_end_int_pref} :cond_check_str_pref
 
     :cond_check_str_pref
     const-string v1, "pref_capture_resolution"
@@ -10478,6 +10654,374 @@
     :catch_enforce
     move-exception v0
 
+    return-void
+.end method
+
+.method public static isAv1EncodingSupported()Z
+    .locals 3
+
+    :try_start_av1
+    sget-object v0, Landroid/os/Build;->DEVICE:Ljava/lang/String;
+
+    if-eqz v0, :cond_av1_hw
+
+    sget-object v1, Ljava/util/Locale;->ROOT:Ljava/util/Locale;
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->toLowerCase(Ljava/util/Locale;)Ljava/lang/String;
+
+    move-result-object v0
+
+    const-string v1, "oriole"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "raven"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "bluejay"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "panther"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "cheetah"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "lynx"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "felix"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_false
+
+    const-string v1, "tangorpro"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_av1_hw
+
+    :cond_av1_false
+    const/4 v0, 0x0
+
+    return v0
+
+    :cond_av1_hw
+    sget-object v0, Landroid/os/Build;->HARDWARE:Ljava/lang/String;
+
+    if-eqz v0, :cond_av1_true
+
+    sget-object v1, Ljava/util/Locale;->ROOT:Ljava/util/Locale;
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->toLowerCase(Ljava/util/Locale;)Ljava/lang/String;
+
+    move-result-object v0
+
+    const-string v1, "gs101"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_hw_false
+
+    const-string v1, "gs201"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_hw_false
+
+    const-string v1, "cheetah"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_av1_hw_false
+
+    const-string v1, "panther"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_av1_true
+
+    :cond_av1_hw_false
+    const/4 v0, 0x0
+
+    return v0
+    :try_end_av1
+    .catchall {:try_start_av1 .. :try_end_av1} :catchall_av1
+
+    :catchall_av1
+    :cond_av1_true
+    const/4 v0, 0x1
+
+    return v0
+.end method
+
+.method public static isBentoEnabled()Z
+    .locals 3
+
+    :try_start_bento
+    const-string v0, "pref_camera_bento_hdr_key"
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getPrefEntry(Ljava/lang/String;)Ljava/lang/Object;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_bento_sp
+
+    const/4 v1, 0x1
+
+    invoke-static {v0, v1}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->checkPrefValue(Ljava/lang/Object;Z)Z
+
+    move-result v0
+
+    return v0
+
+    :cond_bento_sp
+    const/4 v0, 0x0
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getSharedPrefs(Landroid/content/Context;)Landroid/content/SharedPreferences;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_bento_default
+
+    const-string v2, "pref_camera_bento_hdr_key"
+
+    const/4 v1, 0x1
+
+    invoke-interface {v0, v2, v1}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z
+
+    move-result v0
+
+    return v0
+    :try_end_bento
+    .catchall {:try_start_bento .. :try_end_bento} :catchall_bento
+
+    :catchall_bento
+    :cond_bento_default
+    const/4 v0, 0x1
+
+    return v0
+.end method
+
+.method public static filterBentoEnabled(Z)Z
+    .locals 1
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
+
+    move-result v0
+
+    if-nez v0, :cond_bento_orig
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_bento_orig
+
+    const/4 p0, 0x1
+
+    return p0
+
+    :cond_bento_orig
+    return p0
+.end method
+
+.method public static getMaxHdrRatioOverride()F
+    .locals 3
+
+    :try_start_hdr
+    const-string v0, "pref_camera_hdr_ratio_key"
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getPrefEntry(Ljava/lang/String;)Ljava/lang/Object;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_hdr_sp
+
+    invoke-virtual {v0}, Ljava/lang/Object;->toString()Ljava/lang/String;
+
+    move-result-object v0
+
+    goto :cond_hdr_parse
+
+    :cond_hdr_sp
+    const/4 v0, 0x0
+
+    invoke-static {v0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getSharedPrefs(Landroid/content/Context;)Landroid/content/SharedPreferences;
+
+    move-result-object v0
+
+    if-eqz v0, :cond_hdr_default
+
+    const-string v1, "pref_camera_hdr_ratio_key"
+
+    const-string v2, "16"
+
+    invoke-interface {v0, v1, v2}, Landroid/content/SharedPreferences;->getString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+
+    move-result-object v0
+
+    :cond_hdr_parse
+    if-eqz v0, :cond_hdr_default
+
+    const-string v1, "stock"
+
+    invoke-virtual {v1, v0}, Ljava/lang/String;->equalsIgnoreCase(Ljava/lang/String;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_hdr_none
+
+    const-string v1, "0"
+
+    invoke-virtual {v1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_hdr_16
+
+    :cond_hdr_none
+    const/4 v0, 0x0
+
+    return v0
+
+    :cond_hdr_16
+    const-string v1, "16"
+
+    invoke-virtual {v1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_hdr_24
+
+    const/high16 v0, 0x41800000    # 16.0f
+
+    return v0
+
+    :cond_hdr_24
+    const-string v1, "24"
+
+    invoke-virtual {v1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_hdr_32
+
+    const/high16 v0, 0x41c00000    # 24.0f
+
+    return v0
+
+    :cond_hdr_32
+    const-string v1, "32"
+
+    invoke-virtual {v1, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_hdr_default
+
+    const/high16 v0, 0x42000000    # 32.0f
+
+    return v0
+    :try_end_hdr
+    .catchall {:try_start_hdr .. :try_end_hdr} :catchall_hdr
+
+    :catchall_hdr
+    :cond_hdr_default
+    const/high16 v0, 0x41800000    # 16.0f
+
+    return v0
+.end method
+
+.method public static applyBentoAeShotParams(Lcom/google/googlex/gcam/AeShotParams;)V
+    .locals 6
+
+    if-nez p0, :cond_ae_check_front
+
+    return-void
+
+    :cond_ae_check_front
+    :try_start_bento_ae_params
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_ae_get_ratio
+
+    return-void
+
+    :cond_ae_get_ratio
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getMaxHdrRatioOverride()F
+
+    move-result v2
+
+    const/4 v3, 0x0
+
+    cmpl-float v3, v2, v3
+
+    if-gtz v3, :cond_ae_ptr
+
+    return-void
+
+    :cond_ae_ptr
+    iget-wide v0, p0, Lcom/google/googlex/gcam/AeShotParams;->a:J
+
+    const-wide/16 v4, 0x0
+
+    cmp-long v3, v0, v4
+
+    if-nez v3, :cond_ae_set
+
+    return-void
+
+    :cond_ae_set
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->AeShotParams_max_hdr_ratio_override_set(JLcom/google/googlex/gcam/AeShotParams;F)V
+    :try_end_bento_ae_params
+    .catch Ljava/lang/Throwable; {:try_start_bento_ae_params .. :try_end_bento_ae_params} :catch_bento_ae_params
+
+    :catch_bento_ae_params
     return-void
 .end method
 

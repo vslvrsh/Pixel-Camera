@@ -8,6 +8,8 @@ val telephotoPortraitAndZoomPatch = bytecodePatch(
     description = "Unlocks the discrete 10x quick zoom button across Photo and Night Sight modes on Pro and telephoto Pixel devices, dynamic 1x focal length cycling (1.0x -> 1.2x -> 1.5x) on the main camera, and automatic persistence of the last used focal length across app launches.",
     default = true
 ) {
+    extendWith("TomteInitHelper.dex")
+
     compatibleWith(
         "com.google.android.GoogleCamera" to setOf("11.1.040.982810059.19")
     )

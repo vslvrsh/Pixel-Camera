@@ -4,11 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <link.h>
-#include <dlfcn.h>
-#include <errno.h>
+#include <pthread.h>
 #include <android/log.h>
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
@@ -18,6 +14,17 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// Known HAL / AHardwareBuffer 8-bit formats
+#define FMT_RGBA_8888 1
+#define FMT_RGBX_8888 2
+#define FMT_RGB_888   3
+#define FMT_NV21      0x11
+#define FMT_IMPL_DEF  0x22
+#define FMT_YUV_420   0x23
+#define FMT_YV12      0x32315659
+
+static pthread_mutex_t s_lut_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_selfie_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int s_grain_enabled = 0;
 
 JNIEXPORT void JNICALL
@@ -40,9 +47,8 @@ Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeApplyTuning(
     (void)env; (void)clazz; (void)sharpenScale; (void)denoiseMode;
     // Bypassed: Tuning is applied via real-time NEON SIMD algorithms on HardwareBuffers
     // and InterleavedWriteViewU8 frames (nativeSetFineTuning).
-    // Direct .rodata/text segment mprotect is strictly bypassed to guarantee stability
-    // and full compatibility on GrapheneOS (W^X security policies) and Pixel 10.
-    LOGI("nativeApplyTuning: bypassed for GOS and Pixel 10 memory safety");
+    // Direct .rodata/text segment mprotect is strictly bypassed for GrapheneOS W^X safety.
+    LOGI("nativeApplyTuning: bypassed for GOS and Pixel memory safety");
 }
 
 static inline uint8_t clamp_u8(int v) {
@@ -60,25 +66,11 @@ typedef struct {
     float black_lift;    // Black pedestal in [0.0, 1.0] (lifted film blacks)
     float white_comp;    // White shoulder point in [0.0, 1.0] (highlight roll-off)
     float saturation;    // Chroma saturation factor (0.0 = monochrome, >1.0 = punch)
-    float shift_u;       // Blue/Yellow tint (- = yellow/warm, + = blue/cool)
-    float shift_v;       // Red/Green tint (+ = red/amber/magenta, - = olive/cyan)
+    float shift_u;       // Blue/Yellow chroma shift (- = yellow/warm, + = blue/cool)
+    float shift_v;       // Red/Cyan chroma shift (+ = red/amber/magenta, - = green/cyan)
     int is_monochrome;   // 1 for Black Tie (zero chroma)
 } LookProfile;
 
-// Calibrated 1:1 profiles corresponding to Google Camera's 13 Look classes:
-// 0: Original (Default) -> passthrough
-// 1: Natural (Class qvb) -> natural colors & relaxed details
-// 2: Minimal (Class qva) -> organic muted desaturation, lifted shadows
-// 3: Shadows (Class qvf) -> deep dramatic shadows, cool shadow tone (toned down from 1.35x to 1.18x)
-// 4: Vanilla (Class qvc) -> "orange", warm creamy highlights, golden glow
-// 5: Digi (Class quy)    -> "digicam", vivid retro-digital punch (toned down from 1.25x to 1.14x)
-// 6: Black Tie (Class quw)-> pure fine-art monochrome (toned down from 1.45x to 1.26x for Leica-style roll-off)
-// 7: Dijon (Class qvi)   -> "yellow_green_faded", vintage 70s mustard fade
-// 8: Buffalo (Class qvg) -> "unflat", rugged bronze textural contrast (toned down from 1.26x to 1.15x)
-// 9: Flat (Class qvd)    -> "pesto", cinematic log, lifted blacks, muted (refined log curve)
-// 10: Classic (Class qve)-> "portra", Kodak Portra 400 golden film tones
-// 11: Editorial (Class quz)-> "kodachrome", refined magazine contrast (toned down from 1.30x/1.20x to 1.16x/1.10x)
-// 12: Velvet (Class qvh) -> "velvia", Fuji Velvia rich filmic pop (toned down from 1.25x/1.40x to 1.12x/1.18x)
 static const LookProfile s_look_profiles[13] = {
     { 1.00f, 0.0f, 1.0f, 1.00f, 0.0f, 0.0f, 0 },                              // 0: Original
     { 1.02f, 0.0f, 1.0f, 1.02f, 0.0f, 0.0f, 0 },                              // 1: Natural (qvb)
@@ -95,77 +87,11 @@ static const LookProfile s_look_profiles[13] = {
     { 1.12f, 2.0f/255.0f, 252.0f/255.0f, 1.18f, 0.0f, +2.0f, 0 }              // 12: Velvet (qvh)
 };
 
-static uint8_t s_lut_y[13][256];
-static uint8_t s_lut_u[13][256];
-static uint8_t s_lut_v[13][256];
-static int s_luts_initialized = 0;
-
+static int s_static_tables_inited = 0;
 static int8_t s_noise_table[512];
+static uint8_t s_tint_weight[256];
 
-static void init_look_luts(void) {
-    if (s_luts_initialized) return;
-
-    // Initialize 512-byte cyclic Gaussian/film noise pattern
-    uint32_t s = 0x19385721;
-    for (int i = 0; i < 512; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        s_noise_table[i] = (int8_t)((s & 0x1F) - 16); // [-16, 15]
-    }
-
-    for (int id = 0; id < 13; id++) {
-        const LookProfile* p = &s_look_profiles[id];
-        
-        // 1. Build Y (Luma) Tone Curve with continuous smooth sigmoid
-        for (int i = 0; i < 256; i++) {
-            if (id == 0) {
-                s_lut_y[id][i] = (uint8_t)i;
-                continue;
-            }
-            float x = (float)i / 255.0f;
-            float sig;
-            if (x <= 0.0001f) {
-                sig = 0.0f;
-            } else if (x >= 0.9999f) {
-                sig = 1.0f;
-            } else {
-                float xp = powf(x, p->contrast_p);
-                float omxp = powf(1.0f - x, p->contrast_p);
-                sig = xp / (xp + omxp);
-            }
-            float y_out = p->black_lift + sig * (p->white_comp - p->black_lift);
-            int val = (int)roundf(y_out * 255.0f);
-            s_lut_y[id][i] = clamp_u8(val);
-        }
-
-        // 2. Build U and V (Chroma) LUTs with parabolic tapering for highlights and deep shadows
-        for (int i = 0; i < 256; i++) {
-            if (id == 0) {
-                s_lut_u[id][i] = (uint8_t)i;
-                s_lut_v[id][i] = (uint8_t)i;
-                continue;
-            }
-            if (p->is_monochrome) {
-                s_lut_u[id][i] = 128;
-                s_lut_v[id][i] = 128;
-            } else {
-                float d = (float)(i - 128);
-                float d_sat = d * p->saturation;
-                float norm_d = fabsf(d) / 128.0f;
-                if (norm_d > 1.0f) norm_d = 1.0f;
-                float w = 1.0f - norm_d * norm_d; // 1.0 at neutral, 0.0 at saturated extremes
-                if (w < 0.0f) w = 0.0f;
-
-                int u_val = (int)roundf(128.0f + d_sat + p->shift_u * w);
-                int v_val = (int)roundf(128.0f + d_sat + p->shift_v * w);
-                s_lut_u[id][i] = clamp_u8(u_val);
-                s_lut_v[id][i] = clamp_u8(v_val);
-            }
-        }
-    }
-    s_luts_initialized = 1;
-    LOGI("ProPatcher: 13-Look Calibrated Photographic LUTs initialized.");
-}
-
+// Protected by s_lut_mutex
 static float s_ft_contrast = 0.0f;
 static float s_ft_shadows = 0.0f;
 static float s_ft_highlights = 0.0f;
@@ -175,22 +101,51 @@ static float s_ft_warmth = 0.0f;
 static float s_ft_sharpness = 1.0f;
 
 static uint8_t s_active_lut_y[256];
-static uint8_t s_active_lut_u[256];
-static uint8_t s_active_lut_v[256];
-static uint8_t s_tint_weight[256];
 static float s_active_saturation = 1.0f;
 static float s_active_shift_u = 0.0f;
 static float s_active_shift_v = 0.0f;
 static int s_active_look_id = -999;
-static float s_last_c = -999.0f, s_last_s = -999.0f, s_last_h = -999.0f, s_last_v = -999.0f, s_last_t = -999.0f, s_last_w = -999.0f, s_last_sh = -999.0f;
+static float s_last_c = -999.0f, s_last_s = -999.0f, s_last_h = -999.0f;
+static float s_last_v = -999.0f, s_last_t = -999.0f, s_last_w = -999.0f;
 static int s_active_lut_valid = 0;
 
-static void update_active_luts(int lookId) {
+// Caller must hold s_lut_mutex
+static void init_static_tables_locked(void) {
+    if (s_static_tables_inited) return;
+
+    // Initialize 512-byte cyclic film grain noise pattern
+    uint32_t s = 0x19385721u;
+    for (int i = 0; i < 512; i++) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s_noise_table[i] = (int8_t)((s & 0x1Fu) - 16); // [-16, 15]
+    }
+
+    // Luminance-weighted split-toning weights:
+    // Pure shadows (< 24): ramp 0..255 (keeps blacks ink-rich)
+    // Midtones (24..205): 255
+    // Highlights (> 205): ramp 255..0 (specular whites stay clean)
+    for (int i = 0; i < 256; i++) {
+        int w = 255;
+        if (i < 24) {
+            w = (i * 255) / 24;
+        } else if (i > 205) {
+            w = ((255 - i) * 255) / 50;
+        }
+        s_tint_weight[i] = clamp_u8(w);
+    }
+
+    s_static_tables_inited = 1;
+    LOGI("ProPatcher: Photographic tables initialized (thread-safe, 512-byte grain).");
+}
+
+// Caller must hold s_lut_mutex
+static void update_active_luts_locked(int lookId) {
     if (s_active_lut_valid && s_active_look_id == lookId &&
         s_last_c == s_ft_contrast && s_last_s == s_ft_shadows &&
         s_last_h == s_ft_highlights && s_last_v == s_ft_vibrance &&
-        s_last_t == s_ft_tint && s_last_w == s_ft_warmth &&
-        s_last_sh == s_ft_sharpness) {
+        s_last_t == s_ft_tint && s_last_w == s_ft_warmth) {
         return;
     }
 
@@ -221,21 +176,19 @@ static void update_active_luts(int lookId) {
         }
         float y_base = base_p->black_lift + sig * (base_p->white_comp - base_p->black_lift);
 
-        // 2. Shadows photographic bell curve:
-        // Adjusts shadow zones (0.0 .. 0.60, peak at 0.30), anchored at 0.0 so deep blacks stay deep black
+        // 2. Shadows photographic bell curve (0.0..0.60, peak at 0.30, anchored at 0)
         float delta_s = 0.0f;
         if (x < 0.60f) {
             float ts = x / 0.60f;
-            float ws = 4.0f * ts * (1.0f - ts); // Parabolic bell [0 at x=0, 1.0 at x=0.30, 0 at x=0.60]
+            float ws = 4.0f * ts * (1.0f - ts);
             delta_s = s_ft_shadows * 0.28f * ws;
         }
 
-        // 3. Highlights photographic bell curve:
-        // Adjusts highlight zones (0.40 .. 1.0, peak at 0.70), anchored at 1.0 so specular whites stay clean
+        // 3. Highlights photographic bell curve (0.40..1.0, peak at 0.70, anchored at 1)
         float delta_h = 0.0f;
         if (x > 0.40f) {
             float th = (x - 0.40f) / 0.60f;
-            float wh = 4.0f * th * (1.0f - th); // Parabolic bell [0 at x=0.40, 1.0 at x=0.70, 0 at x=1.0]
+            float wh = 4.0f * th * (1.0f - th);
             delta_h = -s_ft_highlights * 0.28f * wh;
         }
 
@@ -243,22 +196,6 @@ static void update_active_luts(int lookId) {
         if (y_out < 0.0f) y_out = 0.0f;
         if (y_out > 1.0f) y_out = 1.0f;
         s_active_lut_y[i] = clamp_u8((int)roundf(y_out * 255.0f));
-    }
-
-    // Build Luminance-Weighted Split-Toning weights:
-    // Pure shadows (< 24): ramp from 0 to 255 (keeps blacks deep and ink-rich)
-    // Midtones (24..205): 255 (full rich photographic tone)
-    // Highlights (> 205): ramp down from 255 to 0 (specular whites stay clean)
-    for (int i = 0; i < 256; i++) {
-        int w = 255;
-        if (i < 24) {
-            w = (i * 255) / 24;
-        } else if (i > 205) {
-            w = ((255 - i) * 255) / 50;
-        }
-        if (w < 0) w = 0;
-        if (w > 255) w = 255;
-        s_tint_weight[i] = (uint8_t)w;
     }
 
     // 4. Vibrance (Saturation)
@@ -269,35 +206,15 @@ static void update_active_luts(int lookId) {
         if (eff_saturation > 2.50f) eff_saturation = 2.50f;
     }
 
-    // 5. Warmth & Tint (Temperature / tint shift)
-    // Warmth shifts along Yellow-Amber / Blue axis: +Warmth decreases U (-24), increases V (+12)
-    // Tint shifts along Magenta / Green axis: +Tint decreases U (-15) and increases V (+20)
-    float eff_shift_u = base_p->shift_u - (s_ft_warmth * 24.0f) - (s_ft_tint * 15.0f);
-    float eff_shift_v = base_p->shift_v + (s_ft_warmth * 12.0f) + (s_ft_tint * 20.0f);
+    // 5. Warmth & Tint (BT.601 YUV chroma shift):
+    // +Warmth (Yellow/Amber): -U (-24), +V (+12)
+    // +Tint (Magenta vs Green): +U (+14), +V (+18)  [since +R,+B,-G requires +U and +V]
+    float eff_shift_u = base_p->shift_u - (s_ft_warmth * 24.0f) + (s_ft_tint * 14.0f);
+    float eff_shift_v = base_p->shift_v + (s_ft_warmth * 12.0f) + (s_ft_tint * 18.0f);
 
     s_active_saturation = eff_saturation;
     s_active_shift_u = eff_shift_u;
     s_active_shift_v = eff_shift_v;
-
-    // Build U and V (Chroma) LUTs
-    for (int i = 0; i < 256; i++) {
-        if (base_p->is_monochrome) {
-            s_active_lut_u[i] = 128;
-            s_active_lut_v[i] = 128;
-        } else {
-            float d = (float)(i - 128);
-            float d_sat = d * eff_saturation;
-            float norm_d = fabsf(d) / 128.0f;
-            if (norm_d > 1.0f) norm_d = 1.0f;
-            float w = 1.0f - norm_d * norm_d;
-            if (w < 0.0f) w = 0.0f;
-
-            int u_val = (int)roundf(128.0f + d_sat + eff_shift_u * w);
-            int v_val = (int)roundf(128.0f + d_sat + eff_shift_v * w);
-            s_active_lut_u[i] = clamp_u8(u_val);
-            s_active_lut_v[i] = clamp_u8(v_val);
-        }
-    }
 
     s_active_look_id = lookId;
     s_last_c = s_ft_contrast;
@@ -306,14 +223,55 @@ static void update_active_luts(int lookId) {
     s_last_v = s_ft_vibrance;
     s_last_t = s_ft_tint;
     s_last_w = s_ft_warmth;
-    s_last_sh = s_ft_sharpness;
     s_active_lut_valid = 1;
+}
+
+typedef struct {
+    uint8_t lut_y[256];
+    uint8_t tint_weight[256];
+    float saturation;
+    float shift_u;
+    float shift_v;
+    int is_monochrome;
+    int has_fine_tuning;
+} GradingSnapshot;
+
+static void capture_grading_snapshot(int lookId, GradingSnapshot* out) {
+    pthread_mutex_lock(&s_lut_mutex);
+    init_static_tables_locked();
+
+    int has_ft = (fabsf(s_ft_contrast) > 0.01f ||
+                  fabsf(s_ft_shadows) > 0.01f ||
+                  fabsf(s_ft_highlights) > 0.01f ||
+                  fabsf(s_ft_vibrance) > 0.01f ||
+                  fabsf(s_ft_tint) > 0.01f ||
+                  fabsf(s_ft_warmth) > 0.01f);
+    out->has_fine_tuning = has_ft;
+
+    if (lookId != 0 || has_ft || s_grain_enabled) {
+        update_active_luts_locked(lookId);
+        const LookProfile* prof = (lookId >= 0 && lookId < 13) ? &s_look_profiles[lookId] : &s_look_profiles[0];
+        memcpy(out->lut_y, s_active_lut_y, 256);
+        memcpy(out->tint_weight, s_tint_weight, 256);
+        out->saturation = s_active_saturation;
+        out->shift_u = s_active_shift_u;
+        out->shift_v = s_active_shift_v;
+        out->is_monochrome = prof->is_monochrome;
+    } else {
+        out->saturation = 1.0f;
+        out->shift_u = 0.0f;
+        out->shift_v = 0.0f;
+        out->is_monochrome = 0;
+    }
+
+    pthread_mutex_unlock(&s_lut_mutex);
 }
 
 JNIEXPORT void JNICALL
 Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeSetFineTuning(
     JNIEnv *env, jclass clazz, jfloat contrast, jfloat shadows, jfloat highlights, jfloat vibrance, jfloat tint, jfloat warmth, jfloat sharpness) {
     (void)env; (void)clazz;
+    pthread_mutex_lock(&s_lut_mutex);
     if (s_ft_contrast != contrast || s_ft_shadows != shadows || s_ft_highlights != highlights ||
         s_ft_vibrance != vibrance || s_ft_tint != tint || s_ft_warmth != warmth || s_ft_sharpness != sharpness) {
         s_ft_contrast = contrast;
@@ -327,9 +285,10 @@ Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeSetFineTuning(
         LOGI("ProPatcher: nativeSetFineTuning: C=%.2f, S=%.2f, H=%.2f, V=%.2f, T=%.2f, W=%.2f, Sh=%.2f",
              contrast, shadows, highlights, vibrance, tint, warmth, sharpness);
     }
+    pthread_mutex_unlock(&s_lut_mutex);
 }
 
-// 128-bit dual-burst NEON SIMD vector grading for Y plane (Luma) - Bit-exact 256-entry Photographic LUT
+// 128-bit dual-burst NEON SIMD vector grading for Y plane (Luma)
 static inline void neon_grade_y(uint8_t* y_data, uint32_t width, uint32_t height, uint32_t stride,
                                 const uint8_t lut[256]) {
     uint8x16x4_t tab0 = vld1q_u8_x4(lut + 0);
@@ -341,10 +300,9 @@ static inline void neon_grade_y(uint8_t* y_data, uint32_t width, uint32_t height
     uint8x16_t v192 = vdupq_n_u8(192);
 
     for (uint32_t y = 0; y < height; y++) {
-        uint8_t* row = y_data + y * stride;
+        uint8_t* row = y_data + (size_t)y * stride;
         uint32_t x = 0;
 
-        // 32 bytes per iteration (Dual 128-bit vector burst)
         for (; x + 32 <= width; x += 32) {
             uint8x16_t vy0 = vld1q_u8(row + x);
             uint8x16_t vy1 = vld1q_u8(row + x + 16);
@@ -381,12 +339,16 @@ static inline void neon_grade_y(uint8_t* y_data, uint32_t width, uint32_t height
     }
 }
 
-// 128-bit dual-burst NEON SIMD vector grading for NV12/NV21 UV plane (Chroma)
+// 128-bit dual-burst NEON SIMD vector grading for semi-planar NV12/NV21 UV plane
 static inline void neon_grade_uv_nv12(uint8_t* uv_data, uint32_t width, uint32_t uv_h, uint32_t stride,
                                       int16_t scale_q8, int16_t shift_even, int16_t shift_odd) {
+    uint32_t uv_bytes = width & ~1u;
+    if (uv_bytes > stride) uv_bytes = stride & ~1u;
+    if (uv_bytes == 0) return;
+
     if (scale_q8 == 0 && shift_even == 0 && shift_odd == 0) {
         for (uint32_t y = 0; y < uv_h; y++) {
-            memset(uv_data + y * stride, 128, width);
+            memset(uv_data + (size_t)y * stride, 128, uv_bytes);
         }
         return;
     }
@@ -400,11 +362,10 @@ static inline void neon_grade_uv_nv12(uint8_t* uv_data, uint32_t width, uint32_t
     int16x4_t v_shift_hi = vget_high_s16(v_shifts);
 
     for (uint32_t y = 0; y < uv_h; y++) {
-        uint8_t* row = uv_data + y * stride;
+        uint8_t* row = uv_data + (size_t)y * stride;
         uint32_t x = 0;
 
-        // 32 bytes per iteration (Dual 128-bit vector burst = 16 UV pairs)
-        for (; x + 32 <= width; x += 32) {
+        for (; x + 32 <= uv_bytes; x += 32) {
             uint8x16_t v0 = vld1q_u8(row + x);
             uint8x16_t v1 = vld1q_u8(row + x + 16);
 
@@ -413,28 +374,24 @@ static inline void neon_grade_uv_nv12(uint8_t* uv_data, uint32_t width, uint32_t
             int16x8_t w1_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1))), v_128);
             int16x8_t w1_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1))), v_128);
 
-            // w0_lo
             int32x4_t p0_lo0 = vmull_s16(vget_low_s16(w0_lo), v_scale);
             int32x4_t p0_lo1 = vmull_s16(vget_high_s16(w0_lo), v_scale);
             int32x4_t s0_lo0 = vaddw_s16(vshrq_n_s32(p0_lo0, 8), v_shift_lo);
             int32x4_t s0_lo1 = vaddw_s16(vshrq_n_s32(p0_lo1, 8), v_shift_hi);
             int16x8_t r0_lo = vaddq_s16(vcombine_s16(vqmovn_s32(s0_lo0), vqmovn_s32(s0_lo1)), v_128);
 
-            // w0_hi
             int32x4_t p0_hi0 = vmull_s16(vget_low_s16(w0_hi), v_scale);
             int32x4_t p0_hi1 = vmull_s16(vget_high_s16(w0_hi), v_scale);
             int32x4_t s0_hi0 = vaddw_s16(vshrq_n_s32(p0_hi0, 8), v_shift_lo);
             int32x4_t s0_hi1 = vaddw_s16(vshrq_n_s32(p0_hi1, 8), v_shift_hi);
             int16x8_t r0_hi = vaddq_s16(vcombine_s16(vqmovn_s32(s0_hi0), vqmovn_s32(s0_hi1)), v_128);
 
-            // w1_lo
             int32x4_t p1_lo0 = vmull_s16(vget_low_s16(w1_lo), v_scale);
             int32x4_t p1_lo1 = vmull_s16(vget_high_s16(w1_lo), v_scale);
             int32x4_t s1_lo0 = vaddw_s16(vshrq_n_s32(p1_lo0, 8), v_shift_lo);
             int32x4_t s1_lo1 = vaddw_s16(vshrq_n_s32(p1_lo1, 8), v_shift_hi);
             int16x8_t r1_lo = vaddq_s16(vcombine_s16(vqmovn_s32(s1_lo0), vqmovn_s32(s1_lo1)), v_128);
 
-            // w1_hi
             int32x4_t p1_hi0 = vmull_s16(vget_low_s16(w1_hi), v_scale);
             int32x4_t p1_hi1 = vmull_s16(vget_high_s16(w1_hi), v_scale);
             int32x4_t s1_hi0 = vaddw_s16(vshrq_n_s32(p1_hi0, 8), v_shift_lo);
@@ -445,7 +402,7 @@ static inline void neon_grade_uv_nv12(uint8_t* uv_data, uint32_t width, uint32_t
             vst1q_u8(row + x + 16, vcombine_u8(vqmovun_s16(r1_lo), vqmovun_s16(r1_hi)));
         }
 
-        for (; x + 16 <= width; x += 16) {
+        for (; x + 16 <= uv_bytes; x += 16) {
             uint8x16_t v = vld1q_u8(row + x);
             int16x8_t w_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v))), v_128);
             int16x8_t w_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v))), v_128);
@@ -465,23 +422,40 @@ static inline void neon_grade_uv_nv12(uint8_t* uv_data, uint32_t width, uint32_t
             vst1q_u8(row + x, vcombine_u8(vqmovun_s16(r_lo), vqmovun_s16(r_hi)));
         }
 
-        for (; x < width; x += 2) {
-            int u = ((int)row[x] - 128) * (int)scale_q8 / 256 + (int)shift_even + 128;
-            int v = ((int)row[x+1] - 128) * (int)scale_q8 / 256 + (int)shift_odd + 128;
+        for (; x + 1 < uv_bytes; x += 2) {
+            int u = (((int)row[x] - 128) * (int)scale_q8 >> 8) + (int)shift_even + 128;
+            int v = (((int)row[x + 1] - 128) * (int)scale_q8 >> 8) + (int)shift_odd + 128;
             row[x] = clamp_u8(u);
-            row[x+1] = clamp_u8(v);
+            row[x + 1] = clamp_u8(v);
         }
     }
 }
 
-// Photographic color grading for RGB (3 channels) or RGBA (4 channels) frames with:
-// 1. Uniform Saturation Scaling (prevents high-frequency thresholding noise/grain)
-// 2. Luminance-Weighted Split-Toning (deep blacks & clean specular whites)
-// 3. Optional Film Grain Synthesis
-// Note: Base Look tone curves and fine-tuning (Contrast, Shadows, Highlights, Sharpness)
-// are applied natively in 16-bit linear RAW space by Gcam's neural HDR+ ISP via TomteMetadata.
-// Here we apply fine-tuning chroma shifts (Vibrance, Warmth, Tint) without double-grading tone curves.
+// Grading for a single planar chroma plane (I420 / YV12 where pixelStride == 1)
+static inline void grade_chroma_planar(uint8_t* plane_data, uint32_t plane_w, uint32_t plane_h, uint32_t stride,
+                                       int16_t scale_q8, int16_t shift_c) {
+    if (plane_w > stride) plane_w = stride;
+    if (plane_w == 0) return;
+
+    if (scale_q8 == 0 && shift_c == 0) {
+        for (uint32_t y = 0; y < plane_h; y++) {
+            memset(plane_data + (size_t)y * stride, 128, plane_w);
+        }
+        return;
+    }
+    if (scale_q8 == 256 && shift_c == 0) return;
+
+    uint8_t lut_c[256];
+    for (int i = 0; i < 256; i++) {
+        int val = (((i - 128) * (int)scale_q8) >> 8) + (int)shift_c + 128;
+        lut_c[i] = clamp_u8(val);
+    }
+    neon_grade_y(plane_data, plane_w, plane_h, stride, lut_c);
+}
+
+// Photographic color grading for RGB (3 channels) or RGBA (4 channels) captured photos
 static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t height, uint32_t channels, uint32_t stride,
+                                    const uint8_t tint_weight[256],
                                     float sat, float shift_u, float shift_v, int is_monochrome) {
     int s_q8 = (int)roundf(sat * 256.0f);
     int s_r = (int)roundf(shift_v * 1.402f);
@@ -489,15 +463,14 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
     int s_b = (int)roundf(shift_u * 1.772f);
     int grain_on = s_grain_enabled;
 
-    // Fast neutral bypass: if not monochrome, no grain, and chroma is neutral
-    if (!is_monochrome && !grain_on && s_q8 == 256 && shift_u == 0.0f && shift_v == 0.0f) {
+    if (!is_monochrome && !grain_on && s_q8 == 256 && s_r == 0 && s_g == 0 && s_b == 0) {
         return;
     }
 
-    uint8x16x4_t tw0 = vld1q_u8_x4(s_tint_weight + 0);
-    uint8x16x4_t tw1 = vld1q_u8_x4(s_tint_weight + 64);
-    uint8x16x4_t tw2 = vld1q_u8_x4(s_tint_weight + 128);
-    uint8x16x4_t tw3 = vld1q_u8_x4(s_tint_weight + 192);
+    uint8x16x4_t tw0 = vld1q_u8_x4(tint_weight + 0);
+    uint8x16x4_t tw1 = vld1q_u8_x4(tint_weight + 64);
+    uint8x16x4_t tw2 = vld1q_u8_x4(tint_weight + 128);
+    uint8x16x4_t tw3 = vld1q_u8_x4(tint_weight + 192);
     uint8x16_t v64 = vdupq_n_u8(64);
     uint8x16_t v128 = vdupq_n_u8(128);
     uint8x16_t v192 = vdupq_n_u8(192);
@@ -505,32 +478,30 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
     int16x8_t v_sq8_base = vdupq_n_s16((int16_t)s_q8);
 
     for (uint32_t y = 0; y < height; y++) {
-        uint8_t* row = data + y * stride;
-        uint32_t y_offset = (y * 79) & 0xFF;
+        uint8_t* row = data + (size_t)y * stride;
+        uint32_t y_offset = (y * 79u) & 0x1FFu;
         uint32_t x = 0;
 
         if (grain_on) {
-            // Scalar fallback with film grain if explicitly enabled
             if (is_monochrome) {
                 for (; x < width; x++) {
-                    uint8_t* pix = row + x * channels;
-                    uint8_t gray = (uint8_t)((pix[0]*77 + pix[1]*150 + pix[2]*29) >> 8);
-                    int n = s_noise_table[(y_offset + x) & 0xFF];
+                    uint8_t* pix = row + (size_t)x * channels;
+                    uint8_t gray = (uint8_t)((pix[0] * 77 + pix[1] * 150 + pix[2] * 29) >> 8);
+                    int n = s_noise_table[(y_offset + x) & 0x1FFu];
                     int mw = 255 - abs((int)gray * 2 - 255);
                     uint8_t out = clamp_u8((int)gray + ((n * mw) >> 10));
                     pix[0] = out; pix[1] = out; pix[2] = out;
                 }
             } else {
                 for (; x < width; x++) {
-                    uint8_t* pix = row + x * channels;
+                    uint8_t* pix = row + (size_t)x * channels;
                     int r = pix[0], g = pix[1], b = pix[2];
                     int luma = (r * 77 + g * 150 + b * 29) >> 8;
-                    int eff_sq8 = s_q8;
-                    int r_sat = luma + (((r - luma) * eff_sq8) >> 8);
-                    int g_sat = luma + (((g - luma) * eff_sq8) >> 8);
-                    int b_sat = luma + (((b - luma) * eff_sq8) >> 8);
-                    int tw = s_tint_weight[luma];
-                    int n = s_noise_table[(y_offset + x) & 0xFF];
+                    int r_sat = luma + (((r - luma) * s_q8) >> 8);
+                    int g_sat = luma + (((g - luma) * s_q8) >> 8);
+                    int b_sat = luma + (((b - luma) * s_q8) >> 8);
+                    int tw = tint_weight[luma];
+                    int n = s_noise_table[(y_offset + x) & 0x1FFu];
                     int mw = 255 - abs(luma * 2 - 255);
                     int gr = (n * mw) >> 10;
                     pix[0] = clamp_u8(r_sat + ((s_r * tw) >> 8) + gr);
@@ -541,11 +512,10 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
             continue;
         }
 
-        // High-Speed 128-bit NEON Vector Pipeline (Zero Film Grain - Default 99.9% Captures)
         if (is_monochrome) {
             if (channels == 3) {
                 for (; x + 16 <= width; x += 16) {
-                    uint8x16x3_t pix = vld3q_u8(row + x * 3);
+                    uint8x16x3_t pix = vld3q_u8(row + (size_t)x * 3);
                     uint16x8_t luma_lo16 = vmull_u8(vget_low_u8(pix.val[0]), vdup_n_u8(77));
                     luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(pix.val[1]), vdup_n_u8(150));
                     luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(pix.val[2]), vdup_n_u8(29));
@@ -560,11 +530,11 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
                     pix.val[0] = y16;
                     pix.val[1] = y16;
                     pix.val[2] = y16;
-                    vst3q_u8(row + x * 3, pix);
+                    vst3q_u8(row + (size_t)x * 3, pix);
                 }
             } else {
                 for (; x + 16 <= width; x += 16) {
-                    uint8x16x4_t pix = vld4q_u8(row + x * 4);
+                    uint8x16x4_t pix = vld4q_u8(row + (size_t)x * 4);
                     uint16x8_t luma_lo16 = vmull_u8(vget_low_u8(pix.val[0]), vdup_n_u8(77));
                     luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(pix.val[1]), vdup_n_u8(150));
                     luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(pix.val[2]), vdup_n_u8(29));
@@ -579,28 +549,26 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
                     pix.val[0] = y16;
                     pix.val[1] = y16;
                     pix.val[2] = y16;
-                    vst4q_u8(row + x * 4, pix);
+                    vst4q_u8(row + (size_t)x * 4, pix);
                 }
             }
             for (; x < width; x++) {
-                uint8_t* pix = row + x * channels;
-                uint8_t gray = (uint8_t)((pix[0]*77 + pix[1]*150 + pix[2]*29) >> 8);
+                uint8_t* pix = row + (size_t)x * channels;
+                uint8_t gray = (uint8_t)((pix[0] * 77 + pix[1] * 150 + pix[2] * 29) >> 8);
                 pix[0] = gray; pix[1] = gray; pix[2] = gray;
             }
         } else {
-            // Full Color Grading (Vibrance, Melanin Skin Protection, Split-Toning)
             for (; x + 16 <= width; x += 16) {
                 uint8x16_t r, g, b;
                 uint8x16_t a = vdupq_n_u8(255);
                 if (channels == 3) {
-                    uint8x16x3_t p3 = vld3q_u8(row + x * 3);
+                    uint8x16x3_t p3 = vld3q_u8(row + (size_t)x * 3);
                     r = p3.val[0]; g = p3.val[1]; b = p3.val[2];
                 } else {
-                    uint8x16x4_t p4 = vld4q_u8(row + x * 4);
+                    uint8x16x4_t p4 = vld4q_u8(row + (size_t)x * 4);
                     r = p4.val[0]; g = p4.val[1]; b = p4.val[2]; a = p4.val[3];
                 }
 
-                // 1. Compute Luma for 16 pixels: Y = (77*R + 150*G + 29*B) >> 8
                 uint16x8_t luma_lo16 = vmull_u8(vget_low_u8(r), vdup_n_u8(77));
                 luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(g), vdup_n_u8(150));
                 luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(b), vdup_n_u8(29));
@@ -612,11 +580,9 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
                 uint8x8_t y_hi = vshrn_n_u16(luma_hi16, 8);
                 uint8x16_t y16 = vcombine_u8(y_lo, y_hi);
 
-                // 2. Uniform Saturation Scaling (eliminates high-frequency thresholding noise)
                 int16x8_t eff_sq8_lo = v_sq8_base;
                 int16x8_t eff_sq8_hi = v_sq8_base;
 
-                // 3. Lookup luminance-weighted split-toning tint weights
                 uint8x16_t tw_r0 = vqtbl4q_u8(tw0, y16);
                 uint8x16_t tw_r1 = vqtbl4q_u8(tw1, vsubq_u8(y16, v64));
                 uint8x16_t tw_r2 = vqtbl4q_u8(tw2, vsubq_u8(y16, v128));
@@ -653,74 +619,61 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
                 int16x8_t y_lo_16 = vreinterpretq_s16_u16(vmovl_u8(y_lo));
                 int16x8_t y_hi_16 = vreinterpretq_s16_u16(vmovl_u8(y_hi));
 
-                // 4. Red widening saturation + tint (32-bit math prevents 16-bit signed overflow artifacts)
                 int16x8_t r_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(r))), y_lo_16);
                 int16x8_t r_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(r))), y_hi_16);
-
                 int32x4_t r_p_lo0 = vmull_s16(vget_low_s16(r_diff_lo), vget_low_s16(eff_sq8_lo));
                 int32x4_t r_p_lo1 = vmull_s16(vget_high_s16(r_diff_lo), vget_high_s16(eff_sq8_lo));
                 int16x8_t r_delta_lo = vcombine_s16(vshrn_n_s32(r_p_lo0, 8), vshrn_n_s32(r_p_lo1, 8));
                 int16x8_t r_out_lo = vaddq_s16(vaddq_s16(y_lo_16, r_delta_lo), tint_r_lo);
-
                 int32x4_t r_p_hi0 = vmull_s16(vget_low_s16(r_diff_hi), vget_low_s16(eff_sq8_hi));
                 int32x4_t r_p_hi1 = vmull_s16(vget_high_s16(r_diff_hi), vget_high_s16(eff_sq8_hi));
                 int16x8_t r_delta_hi = vcombine_s16(vshrn_n_s32(r_p_hi0, 8), vshrn_n_s32(r_p_hi1, 8));
                 int16x8_t r_out_hi = vaddq_s16(vaddq_s16(y_hi_16, r_delta_hi), tint_r_hi);
-
                 uint8x16_t r_final = vcombine_u8(vqmovun_s16(r_out_lo), vqmovun_s16(r_out_hi));
 
-                // 5. Green widening saturation + tint
                 int16x8_t g_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(g))), y_lo_16);
                 int16x8_t g_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(g))), y_hi_16);
-
                 int32x4_t g_p_lo0 = vmull_s16(vget_low_s16(g_diff_lo), vget_low_s16(eff_sq8_lo));
                 int32x4_t g_p_lo1 = vmull_s16(vget_high_s16(g_diff_lo), vget_high_s16(eff_sq8_lo));
                 int16x8_t g_delta_lo = vcombine_s16(vshrn_n_s32(g_p_lo0, 8), vshrn_n_s32(g_p_lo1, 8));
                 int16x8_t g_out_lo = vaddq_s16(vaddq_s16(y_lo_16, g_delta_lo), tint_g_lo);
-
                 int32x4_t g_p_hi0 = vmull_s16(vget_low_s16(g_diff_hi), vget_low_s16(eff_sq8_hi));
                 int32x4_t g_p_hi1 = vmull_s16(vget_high_s16(g_diff_hi), vget_high_s16(eff_sq8_hi));
                 int16x8_t g_delta_hi = vcombine_s16(vshrn_n_s32(g_p_hi0, 8), vshrn_n_s32(g_p_hi1, 8));
                 int16x8_t g_out_hi = vaddq_s16(vaddq_s16(y_hi_16, g_delta_hi), tint_g_hi);
-
                 uint8x16_t g_final = vcombine_u8(vqmovun_s16(g_out_lo), vqmovun_s16(g_out_hi));
 
-                // 6. Blue widening saturation + tint
                 int16x8_t b_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(b))), y_lo_16);
                 int16x8_t b_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(b))), y_hi_16);
-
                 int32x4_t b_p_lo0 = vmull_s16(vget_low_s16(b_diff_lo), vget_low_s16(eff_sq8_lo));
                 int32x4_t b_p_lo1 = vmull_s16(vget_high_s16(b_diff_lo), vget_high_s16(eff_sq8_lo));
                 int16x8_t b_delta_lo = vcombine_s16(vshrn_n_s32(b_p_lo0, 8), vshrn_n_s32(b_p_lo1, 8));
                 int16x8_t b_out_lo = vaddq_s16(vaddq_s16(y_lo_16, b_delta_lo), tint_b_lo);
-
                 int32x4_t b_p_hi0 = vmull_s16(vget_low_s16(b_diff_hi), vget_low_s16(eff_sq8_hi));
                 int32x4_t b_p_hi1 = vmull_s16(vget_high_s16(b_diff_hi), vget_high_s16(eff_sq8_hi));
                 int16x8_t b_delta_hi = vcombine_s16(vshrn_n_s32(b_p_hi0, 8), vshrn_n_s32(b_p_hi1, 8));
                 int16x8_t b_out_hi = vaddq_s16(vaddq_s16(y_hi_16, b_delta_hi), tint_b_hi);
-
                 uint8x16_t b_final = vcombine_u8(vqmovun_s16(b_out_lo), vqmovun_s16(b_out_hi));
 
                 if (channels == 3) {
                     uint8x16x3_t out3;
                     out3.val[0] = r_final; out3.val[1] = g_final; out3.val[2] = b_final;
-                    vst3q_u8(row + x * 3, out3);
+                    vst3q_u8(row + (size_t)x * 3, out3);
                 } else {
                     uint8x16x4_t out4;
                     out4.val[0] = r_final; out4.val[1] = g_final; out4.val[2] = b_final; out4.val[3] = a;
-                    vst4q_u8(row + x * 4, out4);
+                    vst4q_u8(row + (size_t)x * 4, out4);
                 }
             }
 
             for (; x < width; x++) {
-                uint8_t* pix = row + x * channels;
+                uint8_t* pix = row + (size_t)x * channels;
                 int r = pix[0], g = pix[1], b = pix[2];
                 int luma = (r * 77 + g * 150 + b * 29) >> 8;
-                int eff_sq8 = s_q8;
-                int r_sat = luma + (((r - luma) * eff_sq8) >> 8);
-                int g_sat = luma + (((g - luma) * eff_sq8) >> 8);
-                int b_sat = luma + (((b - luma) * eff_sq8) >> 8);
-                int tw = s_tint_weight[luma];
+                int r_sat = luma + (((r - luma) * s_q8) >> 8);
+                int g_sat = luma + (((g - luma) * s_q8) >> 8);
+                int b_sat = luma + (((b - luma) * s_q8) >> 8);
+                int tw = tint_weight[luma];
                 pix[0] = clamp_u8(r_sat + ((s_r * tw) >> 8));
                 pix[1] = clamp_u8(g_sat + ((s_g * tw) >> 8));
                 pix[2] = clamp_u8(b_sat + ((s_b * tw) >> 8));
@@ -729,11 +682,12 @@ static inline void lut_grade_raster(uint8_t* data, uint32_t width, uint32_t heig
     }
 }
 
-// 128-bit ARM64 NEON vector grading for RGBA viewfinder buffers (Format AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
-// Provides bit-exact Tone Mapping (vqtbl4q_u8) + Chroma Grading (Vibrance, Warmth, Tint) with zero stack spills
+// 128-bit ARM64 NEON vector grading for RGBA/RGBX viewfinder buffers (4 bytes/pixel)
 static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t height, uint32_t stride,
                                    const uint8_t lut[256], int16_t scale_uv, int16_t shift_u, int16_t shift_v,
                                    int is_monochrome) {
+    if (stride < width * 4u) return;
+
     uint8x16x4_t tab0 = vld1q_u8_x4(lut + 0);
     uint8x16x4_t tab1 = vld1q_u8_x4(lut + 64);
     uint8x16x4_t tab2 = vld1q_u8_x4(lut + 128);
@@ -744,10 +698,10 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
 
     if (is_monochrome) {
         for (uint32_t y = 0; y < height; y++) {
-            uint8_t* row = data + y * stride;
+            uint8_t* row = data + (size_t)y * stride;
             uint32_t x = 0;
             for (; x + 16 <= width; x += 16) {
-                uint8x16x4_t rgba = vld4q_u8(row + x * 4);
+                uint8x16x4_t rgba = vld4q_u8(row + (size_t)x * 4);
 
                 uint16x8_t luma_lo16 = vmull_u8(vget_low_u8(rgba.val[0]), vdup_n_u8(77));
                 luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(rgba.val[1]), vdup_n_u8(150));
@@ -769,11 +723,11 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
                 rgba.val[0] = y_out;
                 rgba.val[1] = y_out;
                 rgba.val[2] = y_out;
-                vst4q_u8(row + x * 4, rgba);
+                vst4q_u8(row + (size_t)x * 4, rgba);
             }
             for (; x < width; x++) {
-                uint8_t* pix = row + x * 4;
-                uint8_t gray = (uint8_t)((pix[0]*77 + pix[1]*150 + pix[2]*29) >> 8);
+                uint8_t* pix = row + (size_t)x * 4;
+                uint8_t gray = (uint8_t)((pix[0] * 77 + pix[1] * 150 + pix[2] * 29) >> 8);
                 uint8_t out = lut[gray];
                 pix[0] = out; pix[1] = out; pix[2] = out;
             }
@@ -784,23 +738,18 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
     int s_r = (int)roundf((float)shift_v * 1.402f);
     int s_g = (int)roundf(-0.344136f * (float)shift_u - 0.714136f * (float)shift_v);
     int s_b = (int)roundf((float)shift_u * 1.772f);
-    int apply_chroma = (scale_uv != 256 || shift_u != 0 || shift_v != 0);
+    int apply_chroma = (scale_uv != 256 || s_r != 0 || s_g != 0 || s_b != 0);
 
     int16x8_t v_sr = vdupq_n_s16((int16_t)s_r);
     int16x8_t v_sg = vdupq_n_s16((int16_t)s_g);
     int16x8_t v_sb = vdupq_n_s16((int16_t)s_b);
 
-    // Two-Phase L1 Cache-Resident Row Processing:
-    // Phase 1 (Tone Curve Mapping): Uses tab0..tab3 (16 regs) without Chroma math registers. ZERO stack spills.
-    // Phase 2 (Chroma Grading): Uses Chroma math (scale, shift, tint) without tab0..tab3. ZERO stack spills.
-    // Operating row-by-row guarantees Phase 2 hits 100% L1 cache (stride ~4-8KB << 64KB L1 cache).
     for (uint32_t y = 0; y < height; y++) {
-        uint8_t* row = data + y * stride;
+        uint8_t* row = data + (size_t)y * stride;
         uint32_t x = 0;
 
-        // Phase 1: Pure Tone Curve Mapping
         for (; x + 16 <= width; x += 16) {
-            uint8x16x4_t rgba = vld4q_u8(row + x * 4);
+            uint8x16x4_t rgba = vld4q_u8(row + (size_t)x * 4);
 
             uint8x16_t r0 = vqtbl4q_u8(tab0, rgba.val[0]);
             uint8x16_t r1 = vqtbl4q_u8(tab1, vsubq_u8(rgba.val[0], v64));
@@ -820,20 +769,19 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
             uint8x16_t b3 = vqtbl4q_u8(tab3, vsubq_u8(rgba.val[2], v192));
             rgba.val[2] = vorrq_u8(vorrq_u8(b0, b1), vorrq_u8(b2, b3));
 
-            vst4q_u8(row + x * 4, rgba);
+            vst4q_u8(row + (size_t)x * 4, rgba);
         }
         for (; x < width; x++) {
-            uint8_t* pix = row + x * 4;
+            uint8_t* pix = row + (size_t)x * 4;
             pix[0] = lut[pix[0]];
             pix[1] = lut[pix[1]];
             pix[2] = lut[pix[2]];
         }
 
-        // Phase 2: Chroma & Tint Adjustment (Hot L1 Cache)
         if (apply_chroma) {
             x = 0;
             for (; x + 16 <= width; x += 16) {
-                uint8x16x4_t rgba = vld4q_u8(row + x * 4);
+                uint8x16x4_t rgba = vld4q_u8(row + (size_t)x * 4);
 
                 uint16x8_t luma_lo16 = vmull_u8(vget_low_u8(rgba.val[0]), vdup_n_u8(77));
                 luma_lo16 = vmlal_u8(luma_lo16, vget_low_u8(rgba.val[1]), vdup_n_u8(150));
@@ -848,58 +796,46 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
                 int16x8_t y_lo_16 = vreinterpretq_s16_u16(vmovl_u8(y_lo));
                 int16x8_t y_hi_16 = vreinterpretq_s16_u16(vmovl_u8(y_hi));
 
-                // Red channel widening saturation + tint (32-bit math prevents 16-bit signed overflow artifacts)
                 int16x8_t r_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(rgba.val[0]))), y_lo_16);
                 int16x8_t r_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(rgba.val[0]))), y_hi_16);
-
                 int32x4_t r_p_lo0 = vmull_n_s16(vget_low_s16(r_diff_lo), scale_uv);
                 int32x4_t r_p_lo1 = vmull_n_s16(vget_high_s16(r_diff_lo), scale_uv);
                 int16x8_t r_delta_lo = vcombine_s16(vshrn_n_s32(r_p_lo0, 8), vshrn_n_s32(r_p_lo1, 8));
                 int16x8_t r_out_lo = vaddq_s16(vaddq_s16(y_lo_16, r_delta_lo), v_sr);
-
                 int32x4_t r_p_hi0 = vmull_n_s16(vget_low_s16(r_diff_hi), scale_uv);
                 int32x4_t r_p_hi1 = vmull_n_s16(vget_high_s16(r_diff_hi), scale_uv);
                 int16x8_t r_delta_hi = vcombine_s16(vshrn_n_s32(r_p_hi0, 8), vshrn_n_s32(r_p_hi1, 8));
                 int16x8_t r_out_hi = vaddq_s16(vaddq_s16(y_hi_16, r_delta_hi), v_sr);
-
                 rgba.val[0] = vcombine_u8(vqmovun_s16(r_out_lo), vqmovun_s16(r_out_hi));
 
-                // Green channel widening saturation + tint
                 int16x8_t g_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(rgba.val[1]))), y_lo_16);
                 int16x8_t g_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(rgba.val[1]))), y_hi_16);
-
                 int32x4_t g_p_lo0 = vmull_n_s16(vget_low_s16(g_diff_lo), scale_uv);
                 int32x4_t g_p_lo1 = vmull_n_s16(vget_high_s16(g_diff_lo), scale_uv);
                 int16x8_t g_delta_lo = vcombine_s16(vshrn_n_s32(g_p_lo0, 8), vshrn_n_s32(g_p_lo1, 8));
                 int16x8_t g_out_lo = vaddq_s16(vaddq_s16(y_lo_16, g_delta_lo), v_sg);
-
                 int32x4_t g_p_hi0 = vmull_n_s16(vget_low_s16(g_diff_hi), scale_uv);
                 int32x4_t g_p_hi1 = vmull_n_s16(vget_high_s16(g_diff_hi), scale_uv);
                 int16x8_t g_delta_hi = vcombine_s16(vshrn_n_s32(g_p_hi0, 8), vshrn_n_s32(g_p_hi1, 8));
                 int16x8_t g_out_hi = vaddq_s16(vaddq_s16(y_hi_16, g_delta_hi), v_sg);
-
                 rgba.val[1] = vcombine_u8(vqmovun_s16(g_out_lo), vqmovun_s16(g_out_hi));
 
-                // Blue channel widening saturation + tint
                 int16x8_t b_diff_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(rgba.val[2]))), y_lo_16);
                 int16x8_t b_diff_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(rgba.val[2]))), y_hi_16);
-
                 int32x4_t b_p_lo0 = vmull_n_s16(vget_low_s16(b_diff_lo), scale_uv);
                 int32x4_t b_p_lo1 = vmull_n_s16(vget_high_s16(b_diff_lo), scale_uv);
                 int16x8_t b_delta_lo = vcombine_s16(vshrn_n_s32(b_p_lo0, 8), vshrn_n_s32(b_p_lo1, 8));
                 int16x8_t b_out_lo = vaddq_s16(vaddq_s16(y_lo_16, b_delta_lo), v_sb);
-
                 int32x4_t b_p_hi0 = vmull_n_s16(vget_low_s16(b_diff_hi), scale_uv);
                 int32x4_t b_p_hi1 = vmull_n_s16(vget_high_s16(b_diff_hi), scale_uv);
                 int16x8_t b_delta_hi = vcombine_s16(vshrn_n_s32(b_p_hi0, 8), vshrn_n_s32(b_p_hi1, 8));
                 int16x8_t b_out_hi = vaddq_s16(vaddq_s16(y_hi_16, b_delta_hi), v_sb);
-
                 rgba.val[2] = vcombine_u8(vqmovun_s16(b_out_lo), vqmovun_s16(b_out_hi));
 
-                vst4q_u8(row + x * 4, rgba);
+                vst4q_u8(row + (size_t)x * 4, rgba);
             }
             for (; x < width; x++) {
-                uint8_t* pix = row + x * 4;
+                uint8_t* pix = row + (size_t)x * 4;
                 int r = pix[0], g = pix[1], b = pix[2];
                 int luma = (r * 77 + g * 150 + b * 29) >> 8;
                 int r_sat = luma + (((r - luma) * (int)scale_uv) >> 8);
@@ -913,142 +849,190 @@ static inline void neon_grade_rgba(uint8_t* data, uint32_t width, uint32_t heigh
     }
 }
 
+// Safe 3-channel RGB888 viewfinder path (Format AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM = 3)
+static inline void grade_rgb888(uint8_t* data, uint32_t width, uint32_t height, uint32_t stride,
+                                const uint8_t lut[256], int16_t scale_uv, int16_t shift_u, int16_t shift_v,
+                                int is_monochrome) {
+    if (stride < width * 3u) return;
+    int s_r = (int)roundf((float)shift_v * 1.402f);
+    int s_g = (int)roundf(-0.344136f * (float)shift_u - 0.714136f * (float)shift_v);
+    int s_b = (int)roundf((float)shift_u * 1.772f);
+
+    for (uint32_t y = 0; y < height; y++) {
+        uint8_t* row = data + (size_t)y * stride;
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t* pix = row + (size_t)x * 3;
+            if (is_monochrome) {
+                uint8_t gray = (uint8_t)((pix[0] * 77 + pix[1] * 150 + pix[2] * 29) >> 8);
+                uint8_t out = lut[gray];
+                pix[0] = out; pix[1] = out; pix[2] = out;
+            } else {
+                int r = lut[pix[0]];
+                int g = lut[pix[1]];
+                int b = lut[pix[2]];
+                if (scale_uv != 256 || s_r != 0 || s_g != 0 || s_b != 0) {
+                    int luma = (r * 77 + g * 150 + b * 29) >> 8;
+                    r = clamp_u8(luma + (((r - luma) * (int)scale_uv) >> 8) + s_r);
+                    g = clamp_u8(luma + (((g - luma) * (int)scale_uv) >> 8) + s_g);
+                    b = clamp_u8(luma + (((b - luma) * (int)scale_uv) >> 8) + s_b);
+                }
+                pix[0] = (uint8_t)r; pix[1] = (uint8_t)g; pix[2] = (uint8_t)b;
+            }
+        }
+    }
+}
+
 JNIEXPORT void JNICALL
 Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessHardwareBuffer(
     JNIEnv *env, jclass clazz, jobject hwBuffer, jint lookId) {
     (void)clazz;
     if (!hwBuffer || lookId < 0 || lookId > 12) return;
 
-    int has_fine_tuning = (fabsf(s_ft_contrast) > 0.01f ||
-                           fabsf(s_ft_shadows) > 0.01f ||
-                           fabsf(s_ft_highlights) > 0.01f ||
-                           fabsf(s_ft_vibrance) > 0.01f ||
-                           fabsf(s_ft_tint) > 0.01f ||
-                           fabsf(s_ft_warmth) > 0.01f ||
-                           fabsf(s_ft_sharpness - 1.0f) > 0.02f);
+    GradingSnapshot snap;
+    capture_grading_snapshot(lookId, &snap);
 
-    if (lookId == 0 && !has_fine_tuning) {
+    if (lookId == 0 && !snap.has_fine_tuning) {
         return;
     }
 
-    if (!s_luts_initialized) {
-        init_look_luts();
-    }
-
-    update_active_luts(lookId);
-
-    const LookProfile* prof = (lookId >= 0 && lookId < 13) ? &s_look_profiles[lookId] : &s_look_profiles[0];
-    const uint8_t* lut_y = s_active_lut_y;
-
-    float eff_saturation = prof->saturation;
-    if (!prof->is_monochrome) {
-        eff_saturation *= (1.0f + 0.70f * s_ft_vibrance);
-        if (eff_saturation < 0.0f) eff_saturation = 0.0f;
-        if (eff_saturation > 2.50f) eff_saturation = 2.50f;
-    }
-    int16_t scale_uv = prof->is_monochrome ? 0 : (int16_t)roundf(eff_saturation * 256.0f);
+    int16_t scale_uv = snap.is_monochrome ? 0 : (int16_t)roundf(snap.saturation * 256.0f);
     if (scale_uv < 0) scale_uv = 0;
-
-    float eff_shift_u = prof->shift_u - (s_ft_warmth * 24.0f) - (s_ft_tint * 15.0f);
-    float eff_shift_v = prof->shift_v + (s_ft_warmth * 12.0f) + (s_ft_tint * 20.0f);
-    int16_t shift_u = (int16_t)roundf(eff_shift_u);
-    int16_t shift_v = (int16_t)roundf(eff_shift_v);
-    int is_monochrome = prof->is_monochrome;
+    int16_t shift_u = (int16_t)roundf(snap.shift_u);
+    int16_t shift_v = (int16_t)roundf(snap.shift_v);
 
     AHardwareBuffer* buffer = AHardwareBuffer_fromHardwareBuffer(env, hwBuffer);
     if (!buffer) return;
 
     AHardwareBuffer_Desc desc;
     AHardwareBuffer_describe(buffer, &desc);
+    if (desc.width == 0 || desc.height == 0) return;
 
+    int is_rgba = (desc.format == FMT_RGBA_8888 || desc.format == FMT_RGBX_8888);
+    int is_rgb888 = (desc.format == FMT_RGB_888);
+    int is_known_yuv8 = (desc.format == FMT_YUV_420 || desc.format == FMT_NV21 ||
+                         desc.format == FMT_YV12 || desc.format == FMT_IMPL_DEF);
+    if (!is_rgba && !is_rgb888 && !is_known_yuv8) {
+        // Unsupported format (e.g. P010 10-bit HDR, FP16, RAW, BLOB) — skip safely
+        return;
+    }
+
+    // Always request CPU read + write usage so in-place reads are cache-coherent
     AHardwareBuffer_Planes planes;
+    memset(&planes, 0, sizeof(planes));
     int res = AHardwareBuffer_lockPlanes(buffer,
         AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
         -1, NULL, &planes);
 
     if (res != 0) {
         res = AHardwareBuffer_lockPlanes(buffer,
-            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+            AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
             -1, NULL, &planes);
-    }
-
-    int is_rgba = (desc.format == 1 || desc.format == 2 || desc.format == 3);
-
-    if (res != 0) {
-        void* virt = NULL;
-        res = AHardwareBuffer_lock(buffer,
-            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-            -1, NULL, &virt);
-        if (res == 0 && virt) {
-            if (is_rgba) {
-                neon_grade_rgba((uint8_t*)virt, desc.width, desc.height, desc.stride * 4,
-                                lut_y, scale_uv, shift_u, shift_v, is_monochrome);
-            } else {
-                uint32_t y_size = desc.stride * desc.height;
-                neon_grade_y((uint8_t*)virt, desc.width, desc.height, desc.stride, lut_y);
-                uint8_t* uv_data = (uint8_t*)virt + y_size;
-                uint32_t uv_h = desc.height / 2;
-                if (is_monochrome) {
-                    for (uint32_t y = 0; y < uv_h; y++) {
-                        memset(uv_data + y * desc.stride, 128, desc.width);
-                    }
-                } else {
-                    neon_grade_uv_nv12(uv_data, desc.width, uv_h, desc.stride, scale_uv, shift_u, shift_v);
-                }
-            }
-            AHardwareBuffer_unlock(buffer, NULL);
-            return;
-        }
-        return;
     }
 
     uint32_t width = desc.width;
     uint32_t height = desc.height;
 
-    if (is_rgba) {
-        neon_grade_rgba((uint8_t*)planes.planes[0].data, width, height,
-                        planes.planes[0].rowStride, lut_y, scale_uv, shift_u, shift_v, is_monochrome);
-    } else if (planes.planeCount == 1) {
-        uint32_t y_size = planes.planes[0].rowStride * height;
-        neon_grade_y((uint8_t*)planes.planes[0].data, width, height,
-                     planes.planes[0].rowStride, lut_y);
-        uint8_t* uv_data = (uint8_t*)planes.planes[0].data + y_size;
-        uint32_t uv_h = (height + 1) / 2;
-        if (is_monochrome) {
-            for (uint32_t y = 0; y < uv_h; y++) {
-                memset(uv_data + y * planes.planes[0].rowStride, 128, width);
-            }
-        } else {
-            neon_grade_uv_nv12(uv_data, width, uv_h, planes.planes[0].rowStride, scale_uv, shift_u, shift_v);
+    if (res != 0) {
+        // Fallback single-plane lock ONLY for explicit RGBA/RGB888/NV21 (never ambiguous IMPL_DEF)
+        if (desc.format == FMT_IMPL_DEF || desc.format == FMT_YUV_420 || desc.format == FMT_YV12) {
+            return;
         }
-    } else {
-        neon_grade_y((uint8_t*)planes.planes[0].data, width, height,
-                     planes.planes[0].rowStride, lut_y);
-
-        uint32_t uv_h = (height + 1) / 2;
-        int is_interleaved = (planes.planeCount >= 2 && planes.planes[1].pixelStride == 2);
-        if (!is_interleaved && planes.planeCount == 2) {
-            is_interleaved = 1;
+        void* virt = NULL;
+        res = AHardwareBuffer_lock(buffer,
+            AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+            -1, NULL, &virt);
+        if (res != 0) {
+            res = AHardwareBuffer_lock(buffer,
+                AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
+                -1, NULL, &virt);
         }
-
-        if (is_interleaved) {
-            uint32_t uv_stride = planes.planes[1].rowStride ? planes.planes[1].rowStride : width;
-            uint8_t* uv_data = (uint8_t*)planes.planes[1].data;
-            int16_t shift_even = shift_u;
-            int16_t shift_odd = shift_v;
-
-            if (planes.planeCount >= 3 && planes.planes[2].data && planes.planes[2].data < planes.planes[1].data) {
-                uv_data = (uint8_t*)planes.planes[2].data;
-                shift_even = shift_v;
-                shift_odd = shift_u;
-            }
-
-            if (is_monochrome) {
-                for (uint32_t y = 0; y < uv_h; y++) {
-                    memset(uv_data + y * uv_stride, 128, width);
+        if (res == 0 && virt) {
+            if (is_rgba && desc.stride >= width) {
+                neon_grade_rgba((uint8_t*)virt, width, height, desc.stride * 4u,
+                                snap.lut_y, scale_uv, shift_u, shift_v, snap.is_monochrome);
+            } else if (is_rgb888 && desc.stride >= width) {
+                grade_rgb888((uint8_t*)virt, width, height, desc.stride * 3u,
+                             snap.lut_y, scale_uv, shift_u, shift_v, snap.is_monochrome);
+            } else if (desc.format == FMT_NV21 && desc.stride >= width) {
+                size_t y_size = (size_t)desc.stride * height;
+                neon_grade_y((uint8_t*)virt, width, height, desc.stride, snap.lut_y);
+                uint8_t* uv_data = (uint8_t*)virt + y_size;
+                uint32_t uv_h = height / 2u;
+                // NV21 has V first (even), U second (odd)
+                if (snap.is_monochrome) {
+                    uint32_t uv_w = width & ~1u;
+                    for (uint32_t y = 0; y < uv_h; y++) {
+                        memset(uv_data + (size_t)y * desc.stride, 128, uv_w);
+                    }
+                } else {
+                    neon_grade_uv_nv12(uv_data, width, uv_h, desc.stride, scale_uv, shift_v, shift_u);
                 }
-            } else {
-                neon_grade_uv_nv12(uv_data, width, uv_h, uv_stride, scale_uv, shift_even, shift_odd);
+            }
+            AHardwareBuffer_unlock(buffer, NULL);
+        }
+        return;
+    }
+
+    if (planes.planeCount < 1 || !planes.planes[0].data || planes.planes[0].rowStride == 0) {
+        AHardwareBuffer_unlock(buffer, NULL);
+        return;
+    }
+
+    if (is_rgba) {
+        if (planes.planes[0].rowStride >= width * 4u) {
+            neon_grade_rgba((uint8_t*)planes.planes[0].data, width, height,
+                            planes.planes[0].rowStride, snap.lut_y, scale_uv, shift_u, shift_v, snap.is_monochrome);
+        }
+    } else if (is_rgb888) {
+        if (planes.planes[0].rowStride >= width * 3u) {
+            grade_rgb888((uint8_t*)planes.planes[0].data, width, height,
+                         planes.planes[0].rowStride, snap.lut_y, scale_uv, shift_u, shift_v, snap.is_monochrome);
+        }
+    } else if (planes.planeCount >= 2 && planes.planes[0].pixelStride == 1 && planes.planes[0].rowStride >= width) {
+        // 8-bit 4:2:0 YUV (NV12, NV21, I420, YV12)
+        neon_grade_y((uint8_t*)planes.planes[0].data, width, height,
+                     planes.planes[0].rowStride, snap.lut_y);
+
+        uint32_t uv_h = (height + 1u) / 2u;
+        uint32_t uv_plane_w = (width + 1u) / 2u;
+
+        if (planes.planes[1].data != NULL && planes.planes[1].rowStride > 0) {
+            int is_interleaved = (planes.planes[1].pixelStride == 2) || (planes.planeCount == 2);
+            if (is_interleaved) {
+                uint32_t uv_stride = planes.planes[1].rowStride;
+                uint8_t* uv_data = (uint8_t*)planes.planes[1].data;
+                int16_t shift_even = shift_u;
+                int16_t shift_odd = shift_v;
+
+                // NV21: plane[2] (V) precedes plane[1] (U) by 1 byte
+                if (planes.planeCount >= 3 && planes.planes[2].data != NULL &&
+                    planes.planes[2].data < planes.planes[1].data) {
+                    uv_data = (uint8_t*)planes.planes[2].data;
+                    shift_even = shift_v;
+                    shift_odd = shift_u;
+                }
+
+                if (snap.is_monochrome) {
+                    uint32_t uv_bytes = width & ~1u;
+                    if (uv_bytes > uv_stride) uv_bytes = uv_stride & ~1u;
+                    for (uint32_t y = 0; y < uv_h; y++) {
+                        memset(uv_data + (size_t)y * uv_stride, 128, uv_bytes);
+                    }
+                } else {
+                    neon_grade_uv_nv12(uv_data, width, uv_h, uv_stride, scale_uv, shift_even, shift_odd);
+                }
+            } else if (planes.planeCount >= 3 &&
+                       planes.planes[1].pixelStride == 1 &&
+                       planes.planes[2].pixelStride == 1 &&
+                       planes.planes[2].data != NULL &&
+                       planes.planes[2].rowStride > 0) {
+                // Planar 4:2:0 (I420: plane[1]=U, plane[2]=V; YV12: plane[1]=V, plane[2]=U)
+                int16_t shift_p1 = (desc.format == FMT_YV12) ? shift_v : shift_u;
+                int16_t shift_p2 = (desc.format == FMT_YV12) ? shift_u : shift_v;
+                grade_chroma_planar((uint8_t*)planes.planes[1].data, uv_plane_w, uv_h,
+                                    planes.planes[1].rowStride, scale_uv, shift_p1);
+                grade_chroma_planar((uint8_t*)planes.planes[2].data, uv_plane_w, uv_h,
+                                    planes.planes[2].rowStride, scale_uv, shift_p2);
             }
         }
     }
@@ -1060,7 +1044,8 @@ JNIEXPORT void JNICALL
 Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessRasterImage(
     JNIEnv *env, jclass clazz, jlong dataPtr, jint width, jint height, jint channels, jint stride, jint lookId) {
     (void)env; (void)clazz;
-    if (dataPtr == 0 || width <= 0 || height <= 0 || (channels != 3 && channels != 4) || stride <= 0) {
+    if (dataPtr == 0 || width <= 0 || height <= 0 || (channels != 3 && channels != 4) ||
+        (int64_t)stride < (int64_t)width * (int64_t)channels) {
         LOGE("nativeProcessRasterImage: invalid arguments (ptr=0x%lx, w=%d, h=%d, ch=%d, stride=%d)",
              (unsigned long)dataPtr, width, height, channels, stride);
         return;
@@ -1068,125 +1053,110 @@ Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessRasterIma
 
     if (lookId < 0 || lookId > 12) lookId = 0;
 
-    int has_fine_tuning = (fabsf(s_ft_contrast) > 0.01f ||
-                           fabsf(s_ft_shadows) > 0.01f ||
-                           fabsf(s_ft_highlights) > 0.01f ||
-                           fabsf(s_ft_vibrance) > 0.01f ||
-                           fabsf(s_ft_tint) > 0.01f ||
-                           fabsf(s_ft_warmth) > 0.01f ||
-                           fabsf(s_ft_sharpness - 1.0f) > 0.02f);
+    GradingSnapshot snap;
+    capture_grading_snapshot(lookId, &snap);
 
-    if (lookId == 0 && !has_fine_tuning && !s_grain_enabled) {
+    if (lookId == 0 && !snap.has_fine_tuning && !s_grain_enabled) {
         return;
     }
 
-    if (!s_luts_initialized) {
-        init_look_luts();
-    }
+    LOGI("ProPatcher: Grading Captured Photo: %dx%d (%d ch, stride=%d), Look=%d, Mono=%d, Sat=%.2f, U=%.1f, V=%.1f",
+         width, height, channels, stride, lookId, snap.is_monochrome, snap.saturation, snap.shift_u, snap.shift_v);
 
-    update_active_luts(lookId);
-
-    const LookProfile* prof = (lookId >= 0 && lookId < 13) ? &s_look_profiles[lookId] : &s_look_profiles[0];
-    int is_monochrome = prof->is_monochrome;
-
-    float sat = s_active_saturation;
-    float shift_u = s_active_shift_u;
-    float shift_v = s_active_shift_v;
-
-    LOGI("ProPatcher: Grading Captured Photo: %dx%d (%d channels, stride=%d), Look=%d, Mono=%d, Sat=%.2f, U_shift=%.1f, V_shift=%.1f",
-         width, height, channels, stride, lookId, is_monochrome, sat, shift_u, shift_v);
-
-    lut_grade_raster((uint8_t*)dataPtr, (uint32_t)width, (uint32_t)height, (uint32_t)channels, (uint32_t)stride,
-                     sat, shift_u, shift_v, is_monochrome);
+    lut_grade_raster((uint8_t*)(uintptr_t)dataPtr, (uint32_t)width, (uint32_t)height,
+                     (uint32_t)channels, (uint32_t)stride, snap.tint_weight,
+                     snap.saturation, snap.shift_u, snap.shift_v, snap.is_monochrome);
 }
 
 // -----------------------------------------------------------------------------
-// Front Camera Backlight / Melanin Revival & Apple iPhone Skin Tone Engine
+// Front Camera Backlight & Gentle Warm Skin Tone Engine (Opt-In)
 // -----------------------------------------------------------------------------
 static uint8_t s_selfie_luma_lut[256];
 static int s_selfie_lut_inited = 0;
 
-static inline uint8_t clamp_u8_fast(int v) {
-    if (v < 0) return 0;
-    if (v > 255) return 255;
-    return (uint8_t)v;
+static void init_selfie_luma_lut(void) {
+    pthread_mutex_lock(&s_selfie_mutex);
+    if (!s_selfie_lut_inited) {
+        for (int y = 0; y < 256; y++) {
+            // Subtle backlit shadow lift: preserves deep blacks (<16), peaks +8 around y=80, tapers to 0 at y=185
+            float lift = 0.0f;
+            if (y > 16 && y < 185) {
+                float norm = (float)(y - 16) / (185.0f - 16.0f);
+                lift = 8.0f * sinf(norm * 3.14159265f);
+            }
+            s_selfie_luma_lut[y] = clamp_u8((int)roundf((float)y + lift));
+        }
+        s_selfie_lut_inited = 1;
+    }
+    pthread_mutex_unlock(&s_selfie_mutex);
 }
 
-static void init_selfie_luma_lut(void) {
-    if (s_selfie_lut_inited) return;
-    for (int y = 0; y < 256; y++) {
-        // Luminance lift: in backlit scenes, faces are underexposed into y in [25..150].
-        // We lift shadow/lower-midtones smoothly with an asymmetrical bell curve:
-        // y = 0: lift = 0 (deep blacks preserved)
-        // y in [1..25]: subtle smooth toe lift 0..+3
-        // y in [25..130]: sculpted lift up to +18 (peak around y=75-85)
-        // y in [130..195]: smooth taper back to 0
-        // y in [195..255]: 0 (highlights stay clean)
-        float lift = 0.0f;
-        if (y > 0 && y < 200) {
-            float norm = (float)y / 200.0f; // 0..1
-            lift = 18.0f * sinf(norm * 3.14159265f);
-        }
-        int new_y = (int)roundf((float)y + lift);
-        if (new_y < 0) new_y = 0;
-        if (new_y > 255) new_y = 255;
-        s_selfie_luma_lut[y] = (uint8_t)new_y;
-    }
-    s_selfie_lut_inited = 1;
+static inline float smoothstep01(float edge0, float edge1, float x) {
+    if (x <= edge0) return 0.0f;
+    if (x >= edge1) return 1.0f;
+    float t = (x - edge0) / (edge1 - edge0);
+    return t * t * (3.0f - 2.0f * t);
 }
 
 static void grade_front_backlight_raster(uint8_t* data, uint32_t width, uint32_t height, uint32_t channels, uint32_t stride) {
-    if (!data || width == 0 || height == 0 || (channels != 3 && channels != 4) || stride == 0) return;
+    if (!data || width == 0 || height == 0 || (channels != 3 && channels != 4) ||
+        (uint64_t)stride < (uint64_t)width * (uint64_t)channels) {
+        return;
+    }
     init_selfie_luma_lut();
 
     for (uint32_t y = 0; y < height; y++) {
-        uint8_t* row = data + y * stride;
+        uint8_t* row = data + (size_t)y * stride;
         for (uint32_t x = 0; x < width; x++) {
-            uint8_t* pix = row + x * channels;
+            uint8_t* pix = row + (size_t)x * channels;
             int r = pix[0];
             int g = pix[1];
             int b = pix[2];
 
+            // 1. Gentle shadow recovery in backlit mid-shadows
             int luma = (r * 77 + g * 150 + b * 29) >> 8;
-            if (luma > 0) {
+            if (luma > 16) {
                 int luma_lifted = (int)s_selfie_luma_lut[luma];
                 if (luma_lifted != luma) {
-                    r = clamp_u8_fast((r * luma_lifted) / luma);
-                    g = clamp_u8_fast((g * luma_lifted) / luma);
-                    b = clamp_u8_fast((b * luma_lifted) / luma);
-                    luma = luma_lifted;
+                    r = clamp_u8((r * luma_lifted + (luma >> 1)) / luma);
+                    g = clamp_u8((g * luma_lifted + (luma >> 1)) / luma);
+                    b = clamp_u8((b * luma_lifted + (luma >> 1)) / luma);
+                    luma = (r * 77 + g * 150 + b * 29) >> 8;
                 }
             }
 
-            // Detect skin tones or backlit-damaged ashy skin
-            int is_normal_skin = (luma >= 25 && luma <= 235 && r > g && g >= (b - 15) && (r - luma) >= 2 && (b - luma) <= 15);
-            int is_ashy_skin = (luma >= 25 && luma <= 175 && r >= (g - 6) && g >= (b - 16) && b <= (r + 10) && (abs(r - g) + abs(g - b)) < 52 && (r - luma) <= 12 && (r - luma) >= -6);
+            // 2. Continuous soft skin-tone mask requiring genuine warm chroma
+            // Neutral greys/whites (walls, shirts, clouds) have w_skin = 0 -> untouched
+            int max_c = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            int min_c = r < g ? (r < b ? r : b) : (g < b ? g : b);
+            int chroma = max_c - min_c;
 
-            if (is_ashy_skin) {
-                // Melanin Revival: inject natural warm hemoglobin/melanin perfusion into collapsed shadows
-                r = clamp_u8_fast(r + 16);
-                g = clamp_u8_fast(g + 4);
-                b = clamp_u8_fast(b - 8);
-                // Recompute after revival to flow into warm apple skin curve
-                is_normal_skin = 1;
+            if (r > g && r > b && chroma >= 12 && luma >= 28 && luma <= 232) {
+                float w_luma = smoothstep01(28.0f, 52.0f, (float)luma) *
+                               (1.0f - smoothstep01(205.0f, 232.0f, (float)luma));
+                float w_rg = smoothstep01(4.0f, 18.0f, (float)(r - g));
+                float w_rb = smoothstep01(10.0f, 28.0f, (float)(r - b));
+                float w_gb = smoothstep01(-6.0f, 10.0f, (float)(g - b));
+                float w_chroma = smoothstep01(12.0f, 26.0f, (float)chroma);
+                float w_skin = w_luma * w_rg * w_rb * w_gb * w_chroma;
+
+                if (w_skin > 0.01f) {
+                    // Subtle warm peach bias + gentle 6% saturation boost (no hard jumps, no double warming)
+                    float sat = 1.0f + 0.06f * w_skin;
+                    float rf = (float)luma + ((float)(r - luma) * sat) + (4.0f * w_skin);
+                    float gf = (float)luma + ((float)(g - luma) * sat) + (1.0f * w_skin);
+                    float bf = (float)luma + ((float)(b - luma) * sat) - (2.0f * w_skin);
+                    r = clamp_u8((int)roundf(rf));
+                    g = clamp_u8((int)roundf(gf));
+                    b = clamp_u8((int)roundf(bf));
+                }
             }
 
-            if (is_normal_skin) {
-                // Apple iPhone Warm Memory Color Target:
-                // Peach/amber hue bias + local chroma expansion
-                int r_sat = luma + (((r - luma) * 295) >> 8);
-                int g_sat = luma + (((g - luma) * 280) >> 8);
-                int b_sat = luma + (((b - luma) * 240) >> 8);
-                r = clamp_u8_fast(r_sat + 5);
-                g = clamp_u8_fast(g_sat + 1);
-                b = clamp_u8_fast(b_sat - 3);
-            }
-
-            // Filmic Highlight Soft Shoulder for strong background light sources (sun, window, lamps)
-            if (luma > 225) {
-                if (r > 235) r = 235 + (((r - 235) * 13) / 20);
-                if (g > 235) g = 235 + (((g - 235) * 13) / 20);
-                if (b > 235) b = 235 + (((b - 235) * 13) / 20);
+            // 3. Soft highlight shoulder above 232
+            if (luma > 228) {
+                if (r > 236) r = 236 + (((r - 236) * 15) / 20);
+                if (g > 236) g = 236 + (((g - 236) * 15) / 20);
+                if (b > 236) b = 236 + (((b - 236) * 15) / 20);
             }
 
             pix[0] = (uint8_t)r;
@@ -1200,17 +1170,16 @@ JNIEXPORT void JNICALL
 Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessFrontBacklightImage(
     JNIEnv *env, jclass clazz, jlong dataPtr, jint width, jint height, jint channels, jint stride) {
     (void)env; (void)clazz;
-    if (dataPtr == 0 || width <= 0 || height <= 0 || (channels != 3 && channels != 4) || stride <= 0) {
+    if (dataPtr == 0 || width <= 0 || height <= 0 || (channels != 3 && channels != 4) ||
+        (int64_t)stride < (int64_t)width * (int64_t)channels) {
         LOGE("nativeProcessFrontBacklightImage: invalid arguments (ptr=0x%lx, w=%d, h=%d, ch=%d, stride=%d)",
              (unsigned long)dataPtr, width, height, channels, stride);
         return;
     }
 
-    LOGI("ProPatcher: Applying Front Camera Backlight / Apple Skin Tone Grading: %dx%d (%d channels, stride=%d)",
+    LOGI("ProPatcher: Applying Gentle Front Backlight / Skin Tone Grading: %dx%d (%d ch, stride=%d)",
          width, height, channels, stride);
 
-    grade_front_backlight_raster((uint8_t*)dataPtr, (uint32_t)width, (uint32_t)height, (uint32_t)channels, (uint32_t)stride);
+    grade_front_backlight_raster((uint8_t*)(uintptr_t)dataPtr, (uint32_t)width, (uint32_t)height,
+                                 (uint32_t)channels, (uint32_t)stride);
 }
-
-
-

@@ -35,12 +35,10 @@ val pixelCameraClonePatch = resourcePatch(
                 for (i in 0 until list.length) {
                     val elem = list.item(i) as? Element ?: continue
                     val name = elem.getAttribute("android:name")
-                    if (name.isNotEmpty() && (name.startsWith("com.google.android.GoogleCamera") || name.startsWith("com.google.android.GoogleCameraEng"))) {
-                        elem.setAttribute(
-                            "android:name",
-                            name.replace("com.google.android.GoogleCameraEng", targetPkg)
-                                .replace("com.google.android.GoogleCamera", targetPkg)
-                        )
+                    if (name.startsWith("com.google.android.GoogleCameraEng")) {
+                        elem.setAttribute("android:name", name.replaceFirst("com.google.android.GoogleCameraEng", targetPkg))
+                    } else if (name.startsWith("com.google.android.GoogleCamera") && !name.startsWith(targetPkg)) {
+                        elem.setAttribute("android:name", name.replaceFirst("com.google.android.GoogleCamera", targetPkg))
                     }
                 }
             }
@@ -95,10 +93,35 @@ val pixelCameraClonePatch = resourcePatch(
                 elem.parentNode?.removeChild(elem)
             }
 
-            // 5. Remove split attributes from root if present
+            // 5. Remove split attributes from root if present & lower SDK requirements for Android 11-16 compatibility
             root.removeAttribute("android:requiredSplitTypes")
             root.removeAttribute("android:splitTypes")
             root.removeAttribute("android:isSplitRequired")
+
+            val compileSdk = root.getAttribute("android:compileSdkVersion").toIntOrNull()
+            if (compileSdk == null || compileSdk > 35) {
+                root.setAttribute("android:compileSdkVersion", "35")
+                root.setAttribute("android:compileSdkVersionCodename", "15")
+            }
+            val platformSdk = root.getAttribute("platformBuildVersionCode").toIntOrNull()
+            if (platformSdk == null || platformSdk > 35) {
+                root.setAttribute("platformBuildVersionCode", "35")
+                root.setAttribute("platformBuildVersionName", "15")
+            }
+            val usesSdkList = doc.getElementsByTagName("uses-sdk")
+            if (usesSdkList.length > 0) {
+                val usesSdk = usesSdkList.item(0) as? Element
+                if (usesSdk != null) {
+                    val minSdk = usesSdk.getAttribute("android:minSdkVersion").toIntOrNull()
+                    if (minSdk == null || minSdk > 30) {
+                        usesSdk.setAttribute("android:minSdkVersion", "30")
+                    }
+                    val targetSdk = usesSdk.getAttribute("android:targetSdkVersion").toIntOrNull()
+                    if (targetSdk == null || targetSdk > 35) {
+                        usesSdk.setAttribute("android:targetSdkVersion", "35")
+                    }
+                }
+            }
 
             // 6. Ensure launcher activity-alias and activities explicitly carry app_name label
             val activities = doc.getElementsByTagName("activity")
@@ -159,9 +182,10 @@ val pixelCameraClonePatch = resourcePatch(
             app.morphe.patches.pixelcamera.PixelCameraPatchUtils.injectLocalizedAppNames(this)
         } catch (_: Throwable) {}
 
-        // 7. Inject Max display brightness strings and preference toggles into resources
+        // 7. Inject Max display brightness strings, preference toggles, and native libpropatcher.so
         app.morphe.patches.pixelcamera.PixelCameraPatchUtils.injectMaxBrightnessPreferences(this)
         app.morphe.patches.pixelcamera.PixelCameraPatchUtils.injectImageQualityPreferences(this)
+        app.morphe.patches.pixelcamera.PixelCameraPatchUtils.injectNativeProPatcherLib(this)
 
         // 8. Enforce immediate immersive full-screen window insets on CameraActivity
         try {

@@ -625,7 +625,7 @@ val proControlsPatch = bytecodePatch(
         mutableClassDefByOrNull("Lcom/google/android/apps/camera/activity/main/CameraActivity;")?.let { clazz ->
             clazz.methods.firstOrNull { it.name == "onCreate" }?.let { method ->
                 val impl = method.implementation ?: return@let
-                val newIns = "invoke-static {p0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->enforceImmersiveFullscreen(Landroid/app/Activity;)V".toInstructions(method)
+                val newIns = "invoke-static/range {p0 .. p0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->enforceImmersiveFullscreen(Landroid/app/Activity;)V".toInstructions(method)
                 var pos = 0
                 for (ni in newIns) {
                     impl.addInstruction(pos++, ni)
@@ -633,7 +633,7 @@ val proControlsPatch = bytecodePatch(
             }
             clazz.methods.firstOrNull { it.name == "onResume" }?.let { method ->
                 val impl = method.implementation ?: return@let
-                val newIns = "invoke-static {p0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->enforceImmersiveFullscreen(Landroid/app/Activity;)V".toInstructions(method)
+                val newIns = "invoke-static/range {p0 .. p0}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->enforceImmersiveFullscreen(Landroid/app/Activity;)V".toInstructions(method)
                 var pos = 0
                 for (ni in newIns) {
                     impl.addInstruction(pos++, ni)
