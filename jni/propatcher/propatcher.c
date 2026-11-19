@@ -1183,3 +1183,126 @@ Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessFrontBack
     grade_front_backlight_raster((uint8_t*)(uintptr_t)dataPtr, (uint32_t)width, (uint32_t)height,
                                  (uint32_t)channels, (uint32_t)stride);
 }
+
+// -----------------------------------------------------------------------------
+// Bento HDR+ Highlight Recovery Green-Cast & Black-Level Pedestal Normalizer
+// -----------------------------------------------------------------------------
+// On pre-Pixel-8 sensors (e.g., Pixel 7 Pro 'cheetah' Samsung GN1), forcing
+// ShotParams_bento_enabled_set(true) activates Gcam's linear highlight recovery
+// stage without p23+ Bento green-channel equilibrium coefficients in gcam::Tuning,
+// which can leave an uncompensated green gain + shadow pedestal (G > (R+B)/2).
+// This self-calibrating two-pass filter samples the near-neutral locus:
+// - If the frame is already neutral (delta_g <= 2.5 or ratio_g <= 1.025), it is a no-op.
+// - If a green cast is present on the neutral locus, it normalizes G via an integer
+//   LUT bounded by 0.918 * max(0, G - (R+B)/2) so highlights never shift magenta.
+static void grade_bento_awb_raster(uint8_t* data, uint32_t width, uint32_t height, uint32_t channels, uint32_t stride) {
+    if (!data || width < 16 || height < 16 || (channels != 3 && channels != 4) ||
+        (uint64_t)stride < (uint64_t)width * (uint64_t)channels) {
+        return;
+    }
+
+    uint64_t total_samples = 0;
+    uint64_t match_count = 0;
+    int64_t sum_rb = 0;
+    int64_t sum_g = 0;
+    int64_t sum_excess = 0;
+    uint64_t shadow_count = 0;
+    int64_t sum_shadow_excess = 0;
+
+    for (uint32_t y = 0; y < height; y += 4) {
+        const uint8_t* row = data + (size_t)y * stride;
+        for (uint32_t x = 0; x < width; x += 4) {
+            const uint8_t* pix = row + (size_t)x * channels;
+            int r = (int)pix[0];
+            int g = (int)pix[1];
+            int b = (int)pix[2];
+            int rb = (r + b) >> 1;
+            int rb_diff = r >= b ? (r - b) : (b - r);
+            int g_excess = g - rb;
+            total_samples++;
+
+            if (rb_diff <= 18 && rb >= 25 && rb <= 210 &&
+                g_excess >= -4 && g_excess <= 26 && (g * 100 <= r * 132)) {
+                match_count++;
+                sum_rb += rb;
+                sum_g += g;
+                sum_excess += g_excess;
+                if (rb < 60) {
+                    shadow_count++;
+                    sum_shadow_excess += g_excess;
+                }
+            }
+        }
+    }
+
+    if (match_count < 64 || (match_count * 100ULL) < (total_samples * 8ULL)) {
+        return;
+    }
+
+    float mean_rb = (float)sum_rb / (float)match_count;
+    float mean_g = (float)sum_g / (float)match_count;
+    float delta_g = (float)sum_excess / (float)match_count;
+    float ratio_g = mean_g / (mean_rb > 1.0f ? mean_rb : 1.0f);
+
+    if (delta_g <= 2.5f || ratio_g <= 1.025f) {
+        return;
+    }
+
+    float shadow_dg = (shadow_count >= 16)
+        ? ((float)sum_shadow_excess / (float)shadow_count)
+        : delta_g;
+
+    float clamped_ratio = ratio_g < 1.18f ? ratio_g : 1.18f;
+    float inv_gain = 1.0f / clamped_ratio;
+    float drop_factor = 1.0f - inv_gain;
+    float ped_amp = shadow_dg - (45.0f * drop_factor);
+    if (ped_amp < 0.0f) ped_amp = 0.0f;
+
+    int lut[256];
+    for (int gv = 0; gv < 256; gv++) {
+        float gain_drop = (float)gv * drop_factor;
+        float t1 = (float)gv / 24.0f;
+        if (t1 < 0.0f) t1 = 0.0f;
+        if (t1 > 1.0f) t1 = 1.0f;
+        float t2 = (110.0f - (float)gv) / 70.0f;
+        if (t2 < 0.0f) t2 = 0.0f;
+        if (t2 > 1.0f) t2 = 1.0f;
+        float ped = ped_amp * t1 * t2;
+        int d = (int)(gain_drop + ped + 0.5f);
+        if (d < 0) d = 0;
+        if (d > 64) d = 64;
+        lut[gv] = d;
+    }
+
+    LOGI("ProPatcher: Bento AWB green-cast normalizer active (delta_g=+%.2f, ratio_g=%.4f, shadow_dg=+%.2f)",
+         delta_g, ratio_g, shadow_dg);
+
+    for (uint32_t y = 0; y < height; y++) {
+        uint8_t* row = data + (size_t)y * stride;
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t* pix = row + (size_t)x * channels;
+            int g = (int)pix[1];
+            int rb = ((int)pix[0] + (int)pix[2]) >> 1;
+            if (g > rb) {
+                int diff = g - rb;
+                int max_drop = (diff * 235) >> 8;
+                int des_drop = lut[g];
+                int act_drop = des_drop < max_drop ? des_drop : max_drop;
+                pix[1] = clamp_u8(g - act_drop);
+            }
+        }
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_android_patch_cameralooks_TomteInitHelper_nativeProcessBentoAwbImage(
+    JNIEnv *env, jclass clazz, jlong dataPtr, jint width, jint height, jint channels, jint stride) {
+    (void)env; (void)clazz;
+    if (dataPtr == 0 || width <= 0 || height <= 0 || (channels != 3 && channels != 4) ||
+        (int64_t)stride < (int64_t)width * (int64_t)channels) {
+        return;
+    }
+    grade_bento_awb_raster((uint8_t*)(uintptr_t)dataPtr, (uint32_t)width, (uint32_t)height,
+                           (uint32_t)channels, (uint32_t)stride);
+}
+

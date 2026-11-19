@@ -167,6 +167,9 @@
 .method public static native nativeProcessFrontBacklightImage(JIIII)V
 .end method
 
+.method public static native nativeProcessBentoAwbImage(JIIII)V
+.end method
+
 .method public static getSelectedLookId()I
     .locals 3
 
@@ -326,7 +329,7 @@
 
     :cond_start
     :try_start_proc
-    # 1. Quick check: Is a look active or fine-tuning set, or front backlight fix active?
+    # 1. Quick check: Is a look active, fine-tuning set, front backlight fix active, or Bento AWB normalizer active?
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getSelectedLookId()I
 
     move-result v6
@@ -340,6 +343,12 @@
     if-nez v0, :cond_check_ft
 
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontBacklightFixActive()Z
+
+    move-result v0
+
+    if-nez v0, :cond_check_ft
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoAwbFixActive()Z
 
     move-result v0
 
@@ -443,9 +452,18 @@
 
     move-result v8
 
-    if-eqz v8, :cond_check_raster
+    if-eqz v8, :cond_check_bento_awb
 
     invoke-static/range {v0 .. v5}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeProcessFrontBacklightImage(JIIII)V
+
+    :cond_check_bento_awb
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoAwbFixActive()Z
+
+    move-result v8
+
+    if-eqz v8, :cond_check_raster
+
+    invoke-static/range {v0 .. v5}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->nativeProcessBentoAwbImage(JIIII)V
 
     :cond_check_raster
     if-nez v6, :cond_do_raster
@@ -3310,6 +3328,17 @@
     invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_bento_edamame_force_apply_set(JLcom/google/googlex/gcam/ShotParams;Z)V
 
     :cond_bento_done
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
+
+    move-result v2
+
+    if-nez v2, :cond_peony_done
+
+    const/4 v2, 0x0
+
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->ShotParams_peony_awb_enabled_set(JLcom/google/googlex/gcam/ShotParams;Z)V
+
+    :cond_peony_done
     :try_end_bento_shot
     .catch Ljava/lang/Throwable; {:try_start_bento_shot .. :try_end_bento_shot} :catch_bento_shot
 
@@ -5588,7 +5617,9 @@
 
     if-eqz v0, :cond_check_peony
 
-    const/4 v0, 0x1
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
+
+    move-result v0
 
     return v0
 
@@ -5601,7 +5632,9 @@
 
     if-eqz v0, :cond_check_basil
 
-    const/4 v0, 0x1
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
+
+    move-result v0
 
     return v0
 
@@ -5612,9 +5645,30 @@
 
     move-result v0
 
+    if-eqz v0, :cond_check_pre_slm
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
+
+    move-result v0
+
+    return v0
+
+    :cond_check_pre_slm
+    const-string v0, "pre_slm"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v0
+
     if-eqz v0, :cond_check_creator_granite
 
-    const/4 v0, 0x1
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v0
+
+    if-eqz v0, :cond_check_creator_granite
+
+    const/4 v0, 0x0
 
     return v0
 
@@ -7191,9 +7245,52 @@
 
     move-result v1
 
-    if-eqz v1, :cond_check_orig_r
+    if-eqz v1, :cond_check_max_hdr_ratio_r
 
     const/high16 v0, 0x3f800000    # 1.0f
+
+    invoke-static {v0}, Ljava/lang/Float;->valueOf(F)Ljava/lang/Float;
+
+    move-result-object v0
+
+    invoke-static {v0}, Lj$/util/Optional;->of(Ljava/lang/Object;)Lj$/util/Optional;
+
+    move-result-object v0
+
+    return-object v0
+
+    :cond_check_max_hdr_ratio_r
+    const-string v1, "max_hdr_ratio"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-eqz v1, :cond_check_orig_r
+
+    const-string v1, "portrait"
+
+    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
+
+    move-result v1
+
+    if-nez v1, :cond_check_orig_r
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
+
+    move-result v1
+
+    if-nez v1, :cond_check_orig_r
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getMaxHdrRatioOverride()F
+
+    move-result v0
+
+    const/4 v1, 0x0
+
+    cmpl-float v1, v0, v1
+
+    if-lez v1, :cond_check_orig_r
 
     invoke-static {v0}, Ljava/lang/Float;->valueOf(F)Ljava/lang/Float;
 
@@ -10921,6 +11018,27 @@
     return v0
 .end method
 
+.method public static isBentoAwbFixActive()Z
+    .locals 1
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isFrontCameraActive()Z
+
+    move-result v0
+
+    if-nez v0, :cond_bento_awb_off
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v0
+
+    return v0
+
+    :cond_bento_awb_off
+    const/4 v0, 0x0
+
+    return v0
+.end method
+
 .method public static applyBentoAeShotParams(Lcom/google/googlex/gcam/AeShotParams;)V
     .locals 6
 
@@ -10934,20 +11052,7 @@
 
     move-result v0
 
-    if-eqz v0, :cond_ae_get_ratio
-
-    return-void
-
-    :cond_ae_get_ratio
-    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getMaxHdrRatioOverride()F
-
-    move-result v2
-
-    const/4 v3, 0x0
-
-    cmpl-float v3, v2, v3
-
-    if-gtz v3, :cond_ae_ptr
+    if-eqz v0, :cond_ae_ptr
 
     return-void
 
@@ -10958,7 +11063,32 @@
 
     cmp-long v3, v0, v4
 
-    if-nez v3, :cond_ae_set
+    if-nez v3, :cond_ae_check_bento_slm
+
+    return-void
+
+    :cond_ae_check_bento_slm
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
+
+    move-result v2
+
+    if-eqz v2, :cond_ae_get_ratio
+
+    # Disable legacy_pre_slm_processing (P21/P22 flag) when Bento is enabled so pre-SLM gain is not applied twice
+    const/4 v2, 0x0
+
+    invoke-static {v0, v1, p0, v2}, Lcom/google/googlex/gcam/GcamModuleJNI;->AeShotParams_legacy_pre_slm_processing_set(JLcom/google/googlex/gcam/AeShotParams;Z)V
+
+    :cond_ae_get_ratio
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->getMaxHdrRatioOverride()F
+
+    move-result v2
+
+    const/4 v3, 0x0
+
+    cmpl-float v3, v2, v3
+
+    if-gtz v3, :cond_ae_set
 
     return-void
 
