@@ -475,19 +475,19 @@ object PixelCameraPatchUtils {
             outSo.parentFile?.mkdirs()
             outSo.writeBytes(soBytes)
 
-            // Ensure Morphe stores libpropatcher.so uncompressed (STORED + aligned) when APK uses extractNativeLibs="false"
+            // Ensure Morphe stores libpropatcher.so uncompressed (STORED + aligned) when APK uses extractNativeLibs="false".
+            // Uses ARSCLib's com.reandroid.json (always bundled in Morphe runtime) and locates workingDir via outSo path.
             try {
-                val manifestFile = context.get("AndroidManifest.xml", false)
-                val uncompressedFile = manifestFile.parentFile?.resolve("uncompressed-files.json")
+                // outSo = <workingDir>/root/lib/arm64-v8a/libpropatcher.so
+                val workingDir = outSo.parentFile?.parentFile?.parentFile?.parentFile
+                val uncompressedFile = workingDir?.resolve("uncompressed-files.json")
                 if (uncompressedFile != null && uncompressedFile.exists()) {
-                    val jsonObj = com.google.gson.JsonParser.parseString(
-                        uncompressedFile.readText(Charsets.UTF_8)
-                    ).asJsonObject
-                    val extensions = jsonObj.getAsJsonArray("extensions")
+                    val jsonObj = com.reandroid.json.JSONObject(uncompressedFile.readText(Charsets.UTF_8))
+                    val extensions = jsonObj.optJSONArray("extensions")
                     var hasSoExt = false
                     if (extensions != null) {
-                        for (el in extensions) {
-                            val ext = el.asString
+                        for (i in 0 until extensions.length()) {
+                            val ext = extensions.getString(i)
                             if (ext == ".so" || ext == "so") {
                                 hasSoExt = true
                                 break
@@ -495,18 +495,18 @@ object PixelCameraPatchUtils {
                         }
                     }
                     if (!hasSoExt) {
-                        val paths = jsonObj.getAsJsonArray("paths")
-                            ?: com.google.gson.JsonArray().also { jsonObj.add("paths", it) }
+                        val paths = jsonObj.optJSONArray("paths")
+                            ?: com.reandroid.json.JSONArray().also { jsonObj.put("paths", it) }
                         val targetPath = "lib/arm64-v8a/libpropatcher.so"
                         var alreadyPresent = false
-                        for (el in paths) {
-                            if (el.asString == targetPath) {
+                        for (i in 0 until paths.length()) {
+                            if (paths.getString(i) == targetPath) {
                                 alreadyPresent = true
                                 break
                             }
                         }
                         if (!alreadyPresent) {
-                            paths.add(targetPath)
+                            paths.put(targetPath)
                             uncompressedFile.writeText(jsonObj.toString(), Charsets.UTF_8)
                         }
                     }
