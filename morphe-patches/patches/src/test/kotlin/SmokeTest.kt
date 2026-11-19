@@ -1064,10 +1064,15 @@ class SmokeTest {
         assertTrue(content.contains("nativeProcessFrontBacklightImage(JIIII)V"), "Must contain nativeProcessFrontBacklightImage")
 
         // Verify native library exists and matches TomteProPatcherLoader.EXPECTED_SIZE
+        val builtLib = java.io.File(rootDir, "build/libpropatcher.so")
         val bundledLib = java.io.File("src/main/resources/lib/arm64-v8a/libpropatcher.so")
         val legacyLib = java.io.File(rootDir, "apktool_full/lib/arm64-v8a/libpropatcher.so")
-        val libFile = if (bundledLib.exists()) bundledLib else legacyLib
-        assertTrue(libFile.exists(), "libpropatcher.so must exist at ${bundledLib.path} or ${legacyLib.path}")
+        val libFile = when {
+            builtLib.exists() -> builtLib
+            bundledLib.exists() -> bundledLib
+            else -> legacyLib
+        }
+        assertTrue(libFile.exists(), "libpropatcher.so must exist at ${builtLib.path}, ${bundledLib.path}, or ${legacyLib.path}")
         assertTrue(libFile.length() > 8000, "libpropatcher.so size must be > 8KB (got ${libFile.length()})")
 
         val loaderSmali = java.io.File(rootDir, "smali_patches/TomteProPatcherLoader.smali").readText()

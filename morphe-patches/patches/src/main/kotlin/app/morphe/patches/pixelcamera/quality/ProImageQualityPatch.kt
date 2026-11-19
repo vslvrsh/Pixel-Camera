@@ -17,6 +17,5 @@ val proImageQualityPatch = resourcePatch(
 
     execute {
         PixelCameraPatchUtils.injectImageQualityPreferences(this)
-        PixelCameraPatchUtils.injectNativeProPatcherLib(this)
     }
 }

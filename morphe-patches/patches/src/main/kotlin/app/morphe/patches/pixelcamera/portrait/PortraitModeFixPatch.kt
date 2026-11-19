@@ -28,7 +28,6 @@ val portraitModeFixPatch = bytecodePatch(
             PixelCameraPatchUtils.hookKlmFlags(clazz)
             PixelCameraPatchUtils.hookKlmFlagA(clazz)
             PixelCameraPatchUtils.hookKlmFlagH(clazz)
-            PixelCameraPatchUtils.hookKlmFlagB(clazz)
             PixelCameraPatchUtils.hookKlmFlagR(clazz)
         }
     }

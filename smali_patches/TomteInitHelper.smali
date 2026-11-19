@@ -662,8 +662,19 @@
 .end method
 
 .method private static safeSetGrainEnabled(Z)V
-    .locals 0
+    .locals 1
 
+    if-nez p0, :cond_load_and_set
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteProPatcherLoader;->isLoaded()Z
+
+    move-result v0
+
+    if-nez v0, :cond_load_and_set
+
+    return-void
+
+    :cond_load_and_set
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->ensureNativeLoaded()V
 
     :try_start_safe_grain
@@ -721,6 +732,21 @@
 .method public static syncFineTuningToNative()V
     .locals 7
 
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->hasActiveFineTuning()Z
+
+    move-result v0
+
+    if-nez v0, :cond_do_sync
+
+    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteProPatcherLoader;->isLoaded()Z
+
+    move-result v0
+
+    if-nez v0, :cond_do_sync
+
+    return-void
+
+    :cond_do_sync
     invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->ensureNativeLoaded()V
 
     :try_start_sync
@@ -5900,13 +5926,6 @@
 
     if-eqz v0, :cond_check_milk
 
-    # Only disable Eclipse AE on Pixel 10 family; preserve highlight-aware Eclipse AE on Pixel 6-9 (incl. 7 Pro)
-    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isPixel10Family()Z
-
-    move-result v0
-
-    if-eqz v0, :cond_not_found
-
     const/4 v0, 0x0
 
     return v0
@@ -5933,7 +5952,7 @@
 
     if-eqz v0, :cond_check_front_learned
 
-    const/4 v0, 0x0
+    const/4 v0, 0x1
 
     return v0
 
@@ -5946,7 +5965,7 @@
 
     if-eqz v0, :cond_check_physeter
 
-    const/4 v0, 0x0
+    const/4 v0, 0x1
 
     return v0
 
@@ -5977,88 +5996,15 @@
     return v0
 
     :cond_check_bento_edamame
-    const-string v0, "bento_edamame"
+    const-string v0, "edamame"
 
     invoke-virtual {p0, v0}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
 
     move-result v0
 
-    if-eqz v0, :cond_check_bento_flag
-
-    const/4 v0, 0x0
-
-    return v0
-
-    :cond_check_bento_flag
-    const-string v0, "camera.bento"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-nez v0, :cond_bento_flag_hit
-
-    const-string v0, "camera.enable_bento"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-nez v0, :cond_bento_flag_hit
-
-    const-string v0, "gcam.bento"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_check_lobster
-
-    :cond_bento_flag_hit
-    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isBentoEnabled()Z
-
-    move-result v0
-
-    if-eqz v0, :cond_not_found
-
-    const/4 v0, 0x1
-
-    return v0
-
-    :cond_check_lobster
-    const-string v0, "camera.lobster"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-
-    move-result v0
-
     if-eqz v0, :cond_check_jellybean_setting
 
-    invoke-static {}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->isProDevice()Z
-
-    move-result v0
-
-    if-nez v0, :cond_lobster_pro
-
     const/4 v0, 0x0
-
-    return v0
-
-    :cond_lobster_pro
-    const-string v0, "camera.lobster.default"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_lobster_enable
-
-    const/4 v0, 0x0
-
-    return v0
-
-    :cond_lobster_enable
-    const/4 v0, 0x1
 
     return v0
 

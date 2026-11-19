@@ -308,12 +308,8 @@ val cameraLooksPatch = bytecodePatch(
                                 else -> null
                             } ?: continue
                             val methodName = vectorHooks[2 - j]
-                            val invokeStr = PixelCameraPatchUtils.invokeStaticSingleReg(
-                                reg,
-                                "Lcom/google/android/patch/cameralooks/TomteInitHelper;->$methodName([F)[F"
-                            )
                             val hSmali = """
-                                $invokeStr
+                                invoke-static {v$reg}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->$methodName([F)[F
                                 move-result-object v$reg
                             """.trimIndent()
                             val hInstructions = hSmali.toInstructions(method)
@@ -370,12 +366,8 @@ val cameraLooksPatch = bytecodePatch(
                                 else -> null
                             } ?: continue
                             val methodName = vectorHooks[2 - j]
-                            val invokeStr = PixelCameraPatchUtils.invokeStaticSingleReg(
-                                reg,
-                                "Lcom/google/android/patch/cameralooks/TomteInitHelper;->$methodName([F)[F"
-                            )
                             val hSmali = """
-                                $invokeStr
+                                invoke-static {v$reg}, Lcom/google/android/patch/cameralooks/TomteInitHelper;->$methodName([F)[F
                                 move-result-object v$reg
                             """.trimIndent()
                             val hInstructions = hSmali.toInstructions(method)
@@ -442,9 +434,8 @@ val cameraLooksPatch = bytecodePatch(
             PixelCameraPatchUtils.hookKlmFlags(clazz)
             // Hook klm.a(Lkpr;)Lj$/util/Optional; for binned RAW dimension fallbacks (12MP photo saving fix)
             PixelCameraPatchUtils.hookKlmFlagA(clazz)
-            // Hook klm.h(Lkps;)Ljava/lang/String; and klm.b(Lkps;)Ljava/lang/String; for pure-TFLite portrait models
+            // Hook klm.h(Lkps;)Ljava/lang/String; for pure-TFLite portrait models
             PixelCameraPatchUtils.hookKlmFlagH(clazz)
-            PixelCameraPatchUtils.hookKlmFlagB(clazz)
             // Hook klm.r(Lkps;)Lj$/util/Optional; for Boba Jelly ratios
             PixelCameraPatchUtils.hookKlmFlagR(clazz)
         }

@@ -44,7 +44,7 @@ jobs:
           STRIP="$TOOLCHAIN/llvm-strip"
           echo "Using compiler: $CLANG"
 
-          OUT_DIR="morphe-patches/patches/src/main/resources/lib/arm64-v8a"
+          OUT_DIR="build"
           mkdir -p "$OUT_DIR"
           OUT_SO="$OUT_DIR/libpropatcher.so"
 
@@ -65,7 +65,7 @@ jobs:
           python3 - << 'EOF'
           import base64, pathlib, re
 
-          so_path = pathlib.Path("morphe-patches/patches/src/main/resources/lib/arm64-v8a/libpropatcher.so")
+          so_path = pathlib.Path("build/libpropatcher.so")
           smali_path = pathlib.Path("smali_patches/TomteProPatcherLoader.smali")
 
           so_bytes = so_path.read_bytes()
@@ -145,11 +145,11 @@ jobs:
             Experimental **Bento HDR+ Highlight Recovery** + audit fixes build for **Pixel Camera 11.1.040.982810059.19** (`69703284`), tuned for **Google Pixel 7 Pro (`cheetah`)** and Pixel 6–10.
 
             ### Highlights
-            - **Bento HDR+ Highlight Recovery (Experimental)**: hooks `ShotParams_bento_enabled_set` + `camera.bento*` / `gcam.bento*` on rear cameras while isolating EdgeTPU `bento_edamame` (`false`) for Tensor G2 safety.
+            - **Bento HDR+ Highlight Recovery (Experimental)**: hooks `ShotParams_bento_enabled_set` + `ShotParams_bento_edamame_enabled_set(false)` per-shot on rear cameras without triggering Pixel 11 EdgeTPU (`InitParams` / `edamame`) model loading on startup.
             - **HDR+ Dynamic Range Ratio**: configurable `AeShotParams_max_hdr_ratio_override_set` (`Stock` / `16x (+4 EV)` / `24x (+4.6 EV)` / `32x (+5 EV)`) in *Camera Settings → Advanced settings*.
-            - **Pixel 7 Pro (`cheetah`) Fixes**: adds `camera.lobster` 50MP flags, preserves native **Eclipse AE**, gates hardware AV1 to Tensor G3+, fixes `is50MPActive()` `ClassCastException`.
-            - **Bundled Native `libpropatcher.so` (16KB page-aligned)**: packaged directly inside APK (`lib/arm64-v8a/libpropatcher.so`, uncompressed) with thread-safe LUT snapshots, RGB888 & planar YUV safety, corrected Tint (Magenta/Green) axis, 512-byte film grain mask, and gentle opt-in **Front Camera Backlight Fix**.
-            - **Morphe Compatibility**: `"apkFileType": "APKM"`, `minSdkVersion="30"`, `targetSdkVersion="35"`, Dalvik `/range` register fixes, and `ksf.b()` portrait model routing.
+            - **Post-Permission Startup Crash Fix (`cheetah` / Pixel 6–10)**: disables `camera.use_eclipse` (prevents `libgcam.so` `FatalError: AE on ZSL base frame failed` when Pixel 11 unified Eclipse model FD is absent), removes global `camera.lobster*` override in `getFlagOverride` (prevents `uwj: CameraMetadata missing value` for `SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION` on Pixel 7 Pro's 12MP ultrawide sensor in `msr.a`), disables `InitParams` edamame flags, and performs Bento `ShotParams` setup inside `TomteInitHelper.applyShotParamsDenoiseAndSharpen`.
+            - **Pixel 7 Pro (`cheetah`) Fixes**: gates hardware AV1 to Tensor G3+, fixes `is50MPActive()` `ClassCastException`, lazy-loads `libpropatcher.so` only when a Look/slider/grain is active.
+            - **Native `libpropatcher.so` (16KB page-aligned)**: thread-safe LUT snapshots, RGB888 & planar YUV safety, corrected Tint (Magenta/Green) axis, 512-byte film grain mask, and gentle opt-in **Front Camera Backlight Fix**.
           files: morphe-patches/patches/build/libs/morphe-patches-pixelcamera-1.1.4-p7p-bento.mpp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
